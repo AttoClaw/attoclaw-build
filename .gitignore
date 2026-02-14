@@ -1,0 +1,7 @@
+build/
+bridge/
+*.user
+*.VC.db
+*.VC.opendb
+*.sln
+*.suo
