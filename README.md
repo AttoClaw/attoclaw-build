@@ -1,5 +1,9 @@
 ﻿# AttoClaw
 
+<p align="center">
+<img src="./attoclaw.png" alt="AttoClaw Logo" width="250"/>
+</p>
+
 AttoClaw is a high-performance C++ port of openclaw focused on low overhead, deterministic runtime behavior, and practical local automation.
 
 This repo currently builds a single binary:
