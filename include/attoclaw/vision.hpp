@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <optional>
 #include <string>
@@ -14,6 +14,132 @@ struct VisionFrame {
   int64_t timestamp_ms{0};
 };
 
+inline std::string sh_single_quote(const std::string& s) {
+  std::string out = "'";
+  for (char c : s) {
+    if (c == '\'') {
+      out += "'\"'\"'";
+    } else {
+      out.push_back(c);
+    }
+  }
+  out.push_back('\'');
+  return out;
+}
+
+inline bool command_exists_in_path(const std::string& command) {
+#ifdef _WIN32
+  const CommandResult r = run_command_capture("where " + command, 10);
+#else
+  const CommandResult r = run_command_capture("sh -lc \"command -v " + command + "\"", 10);
+#endif
+  return r.ok && !trim(r.output).empty();
+}
+
+inline bool is_headless_server() {
+#ifdef _WIN32
+  return false;
+#else
+  const char* display = std::getenv("DISPLAY");
+  const char* wayland = std::getenv("WAYLAND_DISPLAY");
+  return (!(display && *display) && !(wayland && *wayland));
+#endif
+}
+
+inline bool try_install_linux_package(const std::string& package_name, int timeout_s = 180,
+                                      std::string* note = nullptr) {
+#ifdef _WIN32
+  (void)package_name;
+  (void)timeout_s;
+  if (note) {
+    *note = "auto install is not supported on Windows for this dependency";
+  }
+  return false;
+#else
+  struct ManagerCommand {
+    std::string manager;
+    std::string command;
+  };
+
+  const std::vector<ManagerCommand> managers = {
+      {"pkg", "pkg install -y " + package_name},
+      {"apt-get", "apt-get install -y " + package_name},
+      {"apt", "apt install -y " + package_name},
+      {"dnf", "dnf install -y " + package_name},
+      {"yum", "yum install -y " + package_name},
+      {"pacman", "pacman -Sy --noconfirm " + package_name},
+      {"zypper", "zypper --non-interactive install " + package_name},
+      {"apk", "apk add --no-progress " + package_name},
+  };
+
+  std::string last_error;
+  for (const auto& item : managers) {
+    if (!command_exists_in_path(item.manager)) {
+      continue;
+    }
+
+    std::string cmd = item.command;
+    if (item.manager != "pkg") {
+      if (command_exists_in_path("sudo")) {
+        cmd = "sudo -n " + cmd;
+      }
+    }
+
+    CommandResult install = run_command_capture(cmd, timeout_s);
+    if (install.ok) {
+      return true;
+    }
+    const std::string err = trim(install.output);
+    if (!err.empty()) {
+      last_error = err;
+    }
+  }
+
+  if (note) {
+    if (!last_error.empty()) {
+      *note = last_error;
+    } else {
+      *note = "no supported package manager found or install failed";
+    }
+  }
+  return false;
+#endif
+}
+
+inline bool ensure_vision_capture_dependencies(std::string* note = nullptr) {
+#ifdef _WIN32
+  return true;
+#else
+  if (is_headless_server()) {
+    if (note) {
+      *note = "vision is unavailable on headless server (DISPLAY/WAYLAND_DISPLAY not set)";
+    }
+    return false;
+  }
+  if (command_exists_in_path("grim") || command_exists_in_path("scrot")) {
+    return true;
+  }
+
+  static bool install_attempted = false;
+  if (!install_attempted) {
+    install_attempted = true;
+    std::string install_note;
+    (void)try_install_linux_package("grim", 180, &install_note);
+    if (!command_exists_in_path("grim")) {
+      (void)try_install_linux_package("scrot", 180, &install_note);
+    }
+  }
+
+  if (command_exists_in_path("grim") || command_exists_in_path("scrot")) {
+    return true;
+  }
+  if (note) {
+    *note = "no screenshot tool available (grim/scrot). Auto-install failed.";
+  }
+  return false;
+#endif
+}
+
 inline bool has_tesseract_ocr() {
 #ifdef _WIN32
   CommandResult r = run_command_capture("where tesseract", 10);
@@ -24,12 +150,41 @@ inline bool has_tesseract_ocr() {
 #endif
 }
 
+inline bool ensure_tesseract_ocr(std::string* note = nullptr) {
+  if (has_tesseract_ocr()) {
+    return true;
+  }
+#ifdef _WIN32
+  if (note) {
+    *note = "tesseract OCR is not installed";
+  }
+  return false;
+#else
+  static bool install_attempted = false;
+  if (!install_attempted) {
+    install_attempted = true;
+    std::string install_note;
+    (void)try_install_linux_package("tesseract-ocr", 240, &install_note);
+    if (!has_tesseract_ocr()) {
+      (void)try_install_linux_package("tesseract", 240, &install_note);
+    }
+  }
+  if (has_tesseract_ocr()) {
+    return true;
+  }
+  if (note) {
+    *note = "tesseract OCR is not installed and auto-install failed";
+  }
+  return false;
+#endif
+}
+
 inline std::string extract_ocr_text(const fs::path& image_path, int timeout_s = 20) {
   const fs::path p = fs::absolute(image_path);
   if (!fs::exists(p)) {
     return "";
   }
-  if (!has_tesseract_ocr()) {
+  if (!ensure_tesseract_ocr()) {
     return "";
   }
 
@@ -182,4 +337,3 @@ inline std::optional<VisionFrame> capture_vision_frame(int max_width = 960, int 
 }
 
 }  // namespace attoclaw
-

@@ -32,14 +32,21 @@ AttoClaw is built for minimal runtime overhead: fast startup, low memory usage, 
 
 Implemented and stable:
 
-- Core CLI: `onboard`, `status`, `agent`, `gateway`, `channels`, `cron`
+- Core CLI: `onboard`, `status`, `doctor`, `agent`, `gateway`, `channels`, `cron`
+- Operator helpers: `send`, `metrics`
 - Agent loop with tool calling
 - Session persistence and memory files
-- Telegram and WhatsApp channels
-- NVIDIA NIM (OpenAI-compatible API)
-- Vision mode and OCR support
+- Channels: Telegram, WhatsApp (bridge), Slack, Discord
+- Email channel (outbound SMTP)
+- Voice notes: channel audio download + automatic transcription into prompt context
+- Providers: OpenAI-compatible (OpenAI/OpenRouter/NVIDIA NIM compatible)
+- Streaming output in CLI (`attoclaw agent --stream`) with tool-call safe buffering
+- Voice transcription tool + CLI (`transcribe`)
+- Vision tools and OCR support (vision blocked on headless servers)
 - Runtime `/stop` cancellation
 - Performance benchmark script
+- Docker workflow, CI build, and basic test suite
+- Dashboard for config editing + gateway management
 
 
 ## Requirements
@@ -56,6 +63,8 @@ Runtime:
 - API key for at least one provider (`openai`, `openrouter`, or `nim`)
 - Node.js + npm for WhatsApp bridge login flow
 - Tesseract OCR (optional, used by vision OCR mode)
+- ffmpeg (optional, used to normalize voice note audio before transcription; auto-install attempted on Linux/Termux)
+- Python 3 (required for dashboard; auto-install attempted on Linux/Termux)
 
 Notes:
 
@@ -88,6 +97,7 @@ From repo root:
 
 ```powershell
 build/Release/attoclaw.exe onboard
+build/Release/attoclaw.exe doctor
 build/Release/attoclaw.exe status
 ```
 
@@ -126,11 +136,15 @@ Default high-level structure:
   "tools": {
     "exec": { "timeout": 60 },
     "web": { "search": { "apiKey": "", "maxResults": 5 } },
+    "transcribe": { "apiKey": "", "apiBase": "", "model": "whisper-1", "timeout": 180 },
     "restrictToWorkspace": false
   },
   "channels": {
     "whatsapp": { "enabled": false, "bridgeUrl": "ws://localhost:3001", "bridgeToken": "", "allowFrom": [] },
-    "telegram": { "enabled": false, "token": "", "allowFrom": [], "proxy": "" }
+    "telegram": { "enabled": false, "token": "", "allowFrom": [], "proxy": "" },
+    "slack": { "enabled": false, "token": "", "channels": [], "allowFrom": [], "pollSeconds": 3 },
+    "discord": { "enabled": false, "token": "", "apiBase": "https://discord.com/api/v10", "channels": [], "allowFrom": [], "pollSeconds": 3 },
+    "email": { "enabled": false, "smtpUrl": "", "useSsl": true, "username": "", "password": "", "from": "", "defaultTo": [], "subjectPrefix": "AttoClaw" }
   }
 }
 ```
@@ -139,6 +153,7 @@ Provider selection behavior:
 
 - Provider is inferred from `agents.defaults.model` prefix/keywords.
 - Env var references like `"$NVIDIA_API_KEY"` and `"${NVIDIA_API_KEY}"` are resolved.
+- Channel secrets also support env var references (tokens/passwords/bridgeToken).
 - Supported env fallbacks:
   - `OPENAI_API_KEY`
   - `OPENROUTER_API_KEY`
@@ -149,10 +164,15 @@ Provider selection behavior:
 ```text
 attoclaw onboard
 attoclaw status
-attoclaw agent [-m MESSAGE] [-s SESSION] [--vision] [--vision-fps FPS] [--vision-frames N]
+attoclaw doctor [--json]
+attoclaw agent [-m MESSAGE] [-s SESSION] [--stream] [--vision] [--vision-fps FPS] [--vision-frames N]
+attoclaw dashboard [--host HOST] [--port PORT]
 attoclaw gateway
 attoclaw channels status
 attoclaw channels login
+attoclaw send --channel CHANNEL --to DEST --message TEXT
+attoclaw transcribe --file AUDIO_PATH [--language LANG] [--prompt TEXT]
+attoclaw metrics [--json]
 attoclaw cron list
 attoclaw cron add --name NAME --message MSG [--every SEC | --cron EXPR | --at ISO]
 attoclaw cron remove JOB_ID
@@ -167,6 +187,12 @@ One-shot chat:
 build/Release/attoclaw.exe agent -m "Hello"
 ```
 
+Streaming one-shot chat:
+
+```powershell
+build/Release/attoclaw.exe agent -m "Explain this repo" --stream
+```
+
 Interactive chat:
 
 ```powershell
@@ -179,6 +205,74 @@ Interactive control commands:
 - `/help` show quick command help
 - `/stop` request immediate cancellation of current in-flight task
 
+Diagnostics:
+
+- `attoclaw doctor` prints configuration and dependency issues (and can output JSON via `--json`).
+
+External CLI routing from message suffix:
+
+- Append `--codex` at the end of a message to run it through Codex CLI.
+- Append `--gemini` at the end of a message to run it through Gemini CLI.
+- You can combine vision with either route by adding `--vision` before the suffix.
+- AttoClaw will attempt auto-install for missing Codex/Gemini CLI via `npm install -g`.
+- For Linux vision requests, AttoClaw will attempt auto-install of `grim`/`scrot` and `tesseract`.
+- On headless servers (no `DISPLAY` and no `WAYLAND_DISPLAY`), vision is blocked.
+
+Examples:
+
+```text
+Write unit tests for auth.ts --codex
+Summarize this repository and suggest next steps --gemini
+Explain what is on my current screen --vision --codex
+```
+
+The same suffix routing also works for background subagent tasks (`spawn` tool).
+
+CLI prerequisites:
+
+```powershell
+npm install -g @openai/codex
+npm install -g @google/gemini-cli
+```
+
+## Docker
+
+Build and run:
+
+```bash
+docker build -t attoclaw:local .
+docker run --rm -it -v attoclaw_data:/data -e HOME=/data attoclaw:local status
+```
+
+Compose:
+
+```bash
+docker compose up --build
+```
+
+## Dashboard
+
+Run a local web dashboard:
+
+```powershell
+build/Release/attoclaw.exe dashboard --host 127.0.0.1 --port 8787
+```
+
+Capabilities:
+
+- View status, channels status, cron list, and gateway runtime state
+- Send one-shot agent prompts (including `--vision`, `--codex`, `--gemini` toggles)
+- Add/remove cron jobs
+- Start/stop gateway and view gateway logs
+- Manage config via a structured editor (booleans toggleable, secrets masked)
+- View doctor output, metrics snapshot, and send test messages
+
+Notes:
+
+- Dashboard binds to localhost by default.
+- Python 3 is required; AttoClaw attempts auto-install on Linux/Termux if missing.
+- Dashboard backend lives at `scripts/dashboard_server.py`.
+
 ## Vision and screen understanding
 
 AttoClaw has two vision pathways:
@@ -189,22 +283,34 @@ AttoClaw has two vision pathways:
 build/Release/attoclaw.exe agent -m "Track on-screen changes" --vision --vision-fps 2 --vision-frames 60
 ```
 
-- Captures frames continuously
-- Sends frame image + OCR text to the model
-- Falls back to OCR/text-only if image ingestion fails
-- Current implementation target: Windows
+- Captures frames continuously (Windows-only)
 
-2. Tool-level screen capture during normal agent turn:
+2. On-demand vision tools for agent/tooling and external CLIs:
 
-- `screen_capture` tool is disabled by default.
-- It is enabled only if the user message contains `--vision`.
-- This applies to both main agent turns and subagents.
+- Add `--vision` to your message (optionally combined with `--codex`/`--gemini`) and AttoClaw will enable the `screen_capture` tool for that request.
+- On Linux/Termux, AttoClaw will auto-install `grim` or `scrot` if missing; on headless servers vision is blocked.
 
-Example:
+## Voice notes (NVIDIA NIM / Whisper)
 
-```text
-Analyze this issue and capture screen context --vision
-```
+AttoClaw can transcribe voice notes received via channels (Telegram voice notes, WhatsApp voice notes, Slack audio files, Discord audio attachments) if transcription is configured.
+
+Behavior:
+
+- Channel adapters download audio to `~/.attoclaw/inbox/...` (WhatsApp bridge downloads to `~/.attoclaw/whatsapp-media`).
+- During message processing, AttoClaw transcribes attached audio and appends a `[Transcription]` block into the prompt context.
+- On Linux/Termux, AttoClaw will try to normalize audio with `ffmpeg` before transcription.
+
+Two common setups:
+
+1. NVIDIA NIM (self-hosted Riva ASR NIM container):
+
+- Set `tools.transcribe.apiBase` to your NIM HTTP base, for example `http://localhost:9000/v1`.
+- `tools.transcribe.apiKey` can be empty for localhost NIM.
+- Set `tools.transcribe.model` to `"auto"` or leave it empty to omit the model field (NIM accepts `file`, `model`, `language`).
+
+2. NVIDIA cloud / key-based OpenAI-compatible endpoint:
+
+- Set `tools.transcribe.apiBase` and `tools.transcribe.apiKey` normally.
 
 ## Channels
 
@@ -241,6 +347,7 @@ This creates/uses:
 
 - `~/.attoclaw/bridge`
 - `~/.attoclaw/whatsapp-auth`
+- `~/.attoclaw/whatsapp-media` (downloaded voice notes)
 
 2. Enable in config:
 
@@ -267,6 +374,27 @@ build/Release/attoclaw.exe gateway
 
 - Empty array means allow all senders
 - If non-empty, sender IDs must match
+
+### Slack
+
+Notes:
+
+- Configure `channels.slack.channels` with channel IDs.
+- The adapter stores cursors in `~/.attoclaw/state/slack_cursors.json` to survive restarts.
+
+### Discord
+
+Notes:
+
+- Configure `channels.discord.channels` with channel IDs.
+- The adapter stores cursors in `~/.attoclaw/state/discord_cursors.json` to survive restarts.
+
+### Email (outbound)
+
+Notes:
+
+- Outbound-only SMTP send (no IMAP/POP receive).
+- Use `attoclaw send --channel email --to you@example.com --message "..."` to test.
 
 ## Scheduled tasks (cron)
 
@@ -300,6 +428,7 @@ Core toolset currently available:
 - `message`
 - `spawn`
 - `cron`
+- `transcribe`
 
 ## Performance optimizations implemented
 
@@ -309,10 +438,22 @@ Core toolset currently available:
 - Adaptive queue backoff (yield then short sleep)
 - Cached tool schema JSON (no repeated rebuild each turn)
 - Lighter default agent limits (`maxTokens`, `maxToolIterations`, `memoryWindow`)
+- Reused libcurl easy handles and enabled keepalive/compression for lower HTTP overhead
 - Release optimization improvements:
   - MSVC: `/GL`, `/LTCG`, `/OPT:REF`, `/OPT:ICF`
   - GCC/Clang: section splitting + GC sections
   - IPO/LTO enabled when supported
+
+## Observability
+
+JSON logs (stderr):
+
+- Set `ATTOCLAW_LOG_JSON=1` to emit JSON log lines.
+
+Metrics:
+
+- Gateway writes a periodic snapshot to `~/.attoclaw/state/metrics.json`.
+- View with `attoclaw metrics` or in the dashboard.
 
 ## Benchmarking
 
@@ -395,7 +536,20 @@ No replies from channel:
 attoclaw-build/
   include/attoclaw/    # runtime headers (agent, tools, channels, config, etc.)
   src/main.cpp        # CLI entrypoint
+  tests/              # minimal CTest suite
   scripts/            # benchmark and helper scripts
+  .github/            # CI workflow
   CMakeLists.txt      # build config
 ```
 
+## Changelog
+
+### 2026-02-15
+
+- Added Slack, Discord, and Email (outbound) channel adapters.
+- Added voice note ingestion for Telegram/Slack/Discord and bridged WhatsApp audio download; automatic transcription into prompt context.
+- Added streaming output (`--stream`) with tool-call safe buffering.
+- Added `doctor`, `send`, and `metrics` commands plus dashboard panels for these.
+- Added cursor persistence for Slack/Discord, rate-limit backoff, and outbound message chunking.
+- Added Docker workflow, CI build workflow, install helper script, and expanded tests.
+- Tuned libcurl performance (handle reuse, keepalive, compression).

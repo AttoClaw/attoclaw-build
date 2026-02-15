@@ -6,6 +6,7 @@
 
 #include "attoclaw/common.hpp"
 #include "attoclaw/events.hpp"
+#include "attoclaw/external_cli.hpp"
 #include "attoclaw/message_bus.hpp"
 #include "attoclaw/provider.hpp"
 #include "attoclaw/tools.hpp"
@@ -16,6 +17,8 @@ class SubagentManager : public SpawnManager {
  public:
   SubagentManager(LLMProvider* provider, fs::path workspace, MessageBus* bus, std::string model,
                   double temperature, double top_p, int max_tokens, std::string brave_api_key,
+                  std::string transcribe_api_key, std::string transcribe_api_base, std::string transcribe_model,
+                  int transcribe_timeout_seconds,
                   int exec_timeout_seconds, bool restrict_to_workspace)
       : provider_(provider),
         workspace_(std::move(workspace)),
@@ -25,6 +28,10 @@ class SubagentManager : public SpawnManager {
         top_p_(top_p),
         max_tokens_(max_tokens),
         brave_api_key_(std::move(brave_api_key)),
+        transcribe_api_key_(std::move(transcribe_api_key)),
+        transcribe_api_base_(std::move(transcribe_api_base)),
+        transcribe_model_(std::move(transcribe_model)),
+        transcribe_timeout_seconds_(transcribe_timeout_seconds),
         exec_timeout_seconds_(exec_timeout_seconds),
         restrict_to_workspace_(restrict_to_workspace),
         running_count_(std::make_shared<std::atomic<int>>(0)) {}
@@ -41,7 +48,7 @@ class SubagentManager : public SpawnManager {
     running_count->fetch_add(1);
 
     // Detached subagent worker thread.
-    std::thread([=]() {
+    std::thread([=, this]() {
       run_subagent(task_id, task, display_label, origin_channel, origin_chat_id);
       running_count->fetch_sub(1);
     }).detach();
@@ -53,27 +60,6 @@ class SubagentManager : public SpawnManager {
   int running_count() const { return running_count_->load(); }
 
  private:
-  static bool strip_vision_flag(std::string& text) {
-    bool found = false;
-    const std::string token = "--vision";
-    std::size_t pos = 0;
-    while ((pos = text.find(token, pos)) != std::string::npos) {
-      const bool left_ok = pos == 0 || std::isspace(static_cast<unsigned char>(text[pos - 1])) != 0;
-      const std::size_t end = pos + token.size();
-      const bool right_ok = end >= text.size() || std::isspace(static_cast<unsigned char>(text[end])) != 0;
-      if (left_ok && right_ok) {
-        text.erase(pos, token.size());
-        found = true;
-      } else {
-        pos = end;
-      }
-    }
-    if (found) {
-      text = trim(text);
-    }
-    return found;
-  }
-
   static std::string summarize_label(const std::string& task) {
     constexpr std::size_t kMax = 30;
     if (task.size() <= kMax) {
@@ -100,61 +86,72 @@ class SubagentManager : public SpawnManager {
                     const std::string& origin_channel, const std::string& origin_chat_id) const {
     std::string final_result;
     std::string status = "ok";
-    std::string task_text = task;
-    const bool vision_enabled = strip_vision_flag(task_text);
+    const ParsedExternalRequest parsed = parse_external_request(task);
+    const std::string task_text = parsed.prompt;
+    const bool vision_enabled = parsed.vision_enabled;
 
     try {
-      ToolRegistry tools;
-      std::optional<fs::path> allowed_dir;
-      if (restrict_to_workspace_) {
-        allowed_dir = workspace_;
-      }
-      tools.register_tool(std::make_shared<ReadFileTool>(allowed_dir));
-      tools.register_tool(std::make_shared<WriteFileTool>(allowed_dir));
-      tools.register_tool(std::make_shared<EditFileTool>(allowed_dir));
-      tools.register_tool(std::make_shared<ListDirTool>(allowed_dir));
-      tools.register_tool(std::make_shared<ExecTool>(exec_timeout_seconds_, workspace_, restrict_to_workspace_));
-      tools.register_tool(std::make_shared<WebSearchTool>(brave_api_key_, 5));
-      tools.register_tool(std::make_shared<WebFetchTool>());
-      tools.register_tool(std::make_shared<SystemInspectTool>());
-      tools.register_tool(std::make_shared<AppControlTool>());
-      tools.register_tool(std::make_shared<ScreenCaptureTool>(vision_enabled));
-
-      json messages = json::array();
-      messages.push_back({{"role", "system"}, {"content", subagent_prompt()}});
-      messages.push_back({{"role", "user"}, {"content", task_text}});
-
-      constexpr int kMaxIterations = 15;
-      for (int i = 0; i < kMaxIterations; ++i) {
-        const LLMResponse resp =
-            provider_->chat(messages, tools.definitions(), model_, max_tokens_, temperature_, top_p_);
-
-        if (resp.has_tool_calls()) {
-          json tool_call_dicts = json::array();
-          for (const auto& tc : resp.tool_calls) {
-            tool_call_dicts.push_back(
-                {{"id", tc.id},
-                 {"type", "function"},
-                 {"function", {{"name", tc.name}, {"arguments", tc.arguments.dump()}}}});
-          }
-          messages.push_back(
-              {{"role", "assistant"}, {"content", resp.content}, {"tool_calls", tool_call_dicts}});
-
-          for (const auto& tc : resp.tool_calls) {
-            const std::string result = tools.execute(tc.name, tc.arguments);
-            messages.push_back({{"role", "tool"},
-                                {"tool_call_id", tc.id},
-                                {"name", tc.name},
-                                {"content", result}});
-          }
-        } else {
-          final_result = resp.content;
-          break;
+      if (vision_enabled && is_headless_server()) {
+        final_result = "Vision is unavailable on headless server (DISPLAY/WAYLAND_DISPLAY not set).";
+      } else if (parsed.external_cli.has_value()) {
+        final_result = run_external_cli(*parsed.external_cli, workspace_, vision_enabled);
+      } else {
+        ToolRegistry tools;
+        std::optional<fs::path> allowed_dir;
+        if (restrict_to_workspace_) {
+          allowed_dir = workspace_;
         }
-      }
+        tools.register_tool(std::make_shared<ReadFileTool>(allowed_dir));
+        tools.register_tool(std::make_shared<WriteFileTool>(allowed_dir));
+        tools.register_tool(std::make_shared<EditFileTool>(allowed_dir));
+        tools.register_tool(std::make_shared<ListDirTool>(allowed_dir));
+        tools.register_tool(std::make_shared<ExecTool>(exec_timeout_seconds_, workspace_, restrict_to_workspace_));
+        tools.register_tool(std::make_shared<WebSearchTool>(brave_api_key_, 5));
+        tools.register_tool(std::make_shared<WebFetchTool>());
+        if (!trim(transcribe_api_key_).empty() && !trim(transcribe_api_base_).empty()) {
+          tools.register_tool(std::make_shared<TranscribeTool>(transcribe_api_key_, transcribe_api_base_,
+                                                               transcribe_model_, transcribe_timeout_seconds_));
+        }
+        tools.register_tool(std::make_shared<SystemInspectTool>());
+        tools.register_tool(std::make_shared<AppControlTool>());
+        tools.register_tool(std::make_shared<ScreenCaptureTool>(vision_enabled));
 
-      if (trim(final_result).empty()) {
-        final_result = "Task completed but no final response was generated.";
+        json messages = json::array();
+        messages.push_back({{"role", "system"}, {"content", subagent_prompt()}});
+        messages.push_back({{"role", "user"}, {"content", task_text}});
+
+        constexpr int kMaxIterations = 15;
+        for (int i = 0; i < kMaxIterations; ++i) {
+          const LLMResponse resp =
+              provider_->chat(messages, tools.definitions(), model_, max_tokens_, temperature_, top_p_);
+
+          if (resp.has_tool_calls()) {
+            json tool_call_dicts = json::array();
+            for (const auto& tc : resp.tool_calls) {
+              tool_call_dicts.push_back(
+                  {{"id", tc.id},
+                   {"type", "function"},
+                   {"function", {{"name", tc.name}, {"arguments", tc.arguments.dump()}}}});
+            }
+            messages.push_back(
+                {{"role", "assistant"}, {"content", resp.content}, {"tool_calls", tool_call_dicts}});
+
+            for (const auto& tc : resp.tool_calls) {
+              const std::string result = tools.execute(tc.name, tc.arguments);
+              messages.push_back({{"role", "tool"},
+                                  {"tool_call_id", tc.id},
+                                  {"name", tc.name},
+                                  {"content", result}});
+            }
+          } else {
+            final_result = resp.content;
+            break;
+          }
+        }
+
+        if (trim(final_result).empty()) {
+          final_result = "Task completed but no final response was generated.";
+        }
       }
     } catch (const std::exception& e) {
       status = "error";
@@ -185,10 +182,13 @@ class SubagentManager : public SpawnManager {
   double top_p_{0.9};
   int max_tokens_{4096};
   std::string brave_api_key_;
+  std::string transcribe_api_key_;
+  std::string transcribe_api_base_;
+  std::string transcribe_model_;
+  int transcribe_timeout_seconds_{180};
   int exec_timeout_seconds_{60};
   bool restrict_to_workspace_{false};
   std::shared_ptr<std::atomic<int>> running_count_;
 };
 
 }  // namespace attoclaw
-

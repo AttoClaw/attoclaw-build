@@ -38,3 +38,13 @@ check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
 if(IPO_SUPPORTED)
   set_property(TARGET attoclaw PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 endif()
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(attoclaw_tests
+    tests/tests.cpp
+  )
+  target_include_directories(attoclaw_tests PRIVATE include)
+  target_link_libraries(attoclaw_tests PRIVATE nlohmann_json::nlohmann_json CURL::libcurl)
+  add_test(NAME attoclaw_tests COMMAND attoclaw_tests)
+endif()

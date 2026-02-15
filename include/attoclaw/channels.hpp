@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "attoclaw/events.hpp"
+#include "attoclaw/metrics.hpp"
 #include "attoclaw/message_bus.hpp"
 
 namespace attoclaw {
@@ -19,14 +20,29 @@ class BaseChannel {
   virtual void stop() = 0;
   virtual void send(const OutboundMessage& msg) = 0;
 
-  const std::string& name() const { return name_; }
+ const std::string& name() const { return name_; }
 
  protected:
   void handle_message(const std::string& sender_id, const std::string& chat_id, const std::string& content) {
     if (!bus_) {
       return;
     }
+    metrics().inc("inbound.total");
+    metrics().inc("inbound.channel." + name_);
     bus_->publish_inbound(InboundMessage{name_, sender_id, chat_id, content});
+  }
+
+  void handle_message(const std::string& sender_id, const std::string& chat_id, const std::string& content,
+                      const std::vector<std::string>& media, const json& metadata = json::object()) {
+    if (!bus_) {
+      return;
+    }
+    metrics().inc("inbound.total");
+    metrics().inc("inbound.channel." + name_);
+    InboundMessage msg{name_, sender_id, chat_id, content};
+    msg.media = media;
+    msg.metadata = metadata;
+    bus_->publish_inbound(msg);
   }
 
   std::string name_;
@@ -39,7 +55,11 @@ class ChannelManager {
 
   void add_channel(std::shared_ptr<BaseChannel> channel) {
     channels_.push_back(channel);
-    bus_->subscribe_outbound(channel->name(), [channel](const OutboundMessage& msg) { channel->send(msg); });
+    bus_->subscribe_outbound(channel->name(), [channel](const OutboundMessage& msg) {
+      metrics().inc("outbound.total");
+      metrics().inc("outbound.channel." + channel->name());
+      channel->send(msg);
+    });
   }
 
   void start_all() {
@@ -68,4 +88,3 @@ class ChannelManager {
 };
 
 }  // namespace attoclaw
-

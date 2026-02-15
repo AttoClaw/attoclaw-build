@@ -13,7 +13,9 @@
 #include "attoclaw/context.hpp"
 #include "attoclaw/cron.hpp"
 #include "attoclaw/events.hpp"
+#include "attoclaw/external_cli.hpp"
 #include "attoclaw/memory.hpp"
+#include "attoclaw/metrics.hpp"
 #include "attoclaw/message_bus.hpp"
 #include "attoclaw/provider.hpp"
 #include "attoclaw/session.hpp"
@@ -133,7 +135,9 @@ class AgentLoop {
  public:
   AgentLoop(MessageBus* bus, LLMProvider* provider, fs::path workspace, std::string model, int max_iterations,
             double temperature, double top_p, int max_tokens, int memory_window, std::string brave_api_key,
-            int exec_timeout_seconds, bool restrict_to_workspace, CronService* cron_service = nullptr)
+            std::string transcribe_api_key, std::string transcribe_api_base, std::string transcribe_model,
+            int transcribe_timeout_seconds, int exec_timeout_seconds, bool restrict_to_workspace,
+            CronService* cron_service = nullptr)
       : bus_(bus),
         provider_(provider),
         workspace_(std::move(workspace)),
@@ -144,11 +148,16 @@ class AgentLoop {
         max_tokens_(max_tokens),
         memory_window_(memory_window),
         brave_api_key_(std::move(brave_api_key)),
+        transcribe_api_key_(std::move(transcribe_api_key)),
+        transcribe_api_base_(std::move(transcribe_api_base)),
+        transcribe_model_(std::move(transcribe_model)),
+        transcribe_timeout_seconds_(transcribe_timeout_seconds),
         exec_timeout_seconds_(exec_timeout_seconds),
         restrict_to_workspace_(restrict_to_workspace),
         context_(workspace_),
         sessions_(workspace_),
         subagents_(provider_, workspace_, bus_, model_, temperature_, top_p_, max_tokens_, brave_api_key_,
+                   transcribe_api_key_, transcribe_api_base_, transcribe_model_, transcribe_timeout_seconds_,
                    exec_timeout_seconds_, restrict_to_workspace_),
         cron_(cron_service) {
     register_default_tools();
@@ -169,7 +178,7 @@ class AgentLoop {
         }
 
         try {
-          auto response = process_message(msg, std::nullopt);
+          auto response = process_message(msg, std::nullopt, {});
           if (response.has_value()) {
             bus_->publish_outbound(*response);
           }
@@ -199,8 +208,25 @@ class AgentLoop {
   std::string process_direct(const std::string& content, const std::string& session_key = "cli:direct",
                              const std::string& channel = "cli", const std::string& chat_id = "direct") {
     const InboundMessage msg{channel, "user", chat_id, content};
-    auto response = process_message(msg, session_key);
-    return response.has_value() ? response->content : std::string();
+    auto response = process_message(msg, session_key, {});
+    std::string out = response.has_value() ? response->content : std::string();
+    out += drain_system_announcements(channel, chat_id);
+    return out;
+  }
+
+  std::string process_direct_stream(const std::string& content,
+                                    const std::function<void(const std::string&)>& on_delta,
+                                    const std::string& session_key = "cli:direct",
+                                    const std::string& channel = "cli", const std::string& chat_id = "direct") {
+    const InboundMessage msg{channel, "user", chat_id, content};
+    auto response = process_message(msg, session_key, on_delta);
+    std::string out = response.has_value() ? response->content : std::string();
+    const std::string extra = drain_system_announcements(channel, chat_id);
+    if (on_delta && !extra.empty()) {
+      on_delta(extra);
+    }
+    out += extra;
+    return out;
   }
 
  private:
@@ -242,6 +268,10 @@ class AgentLoop {
         std::make_shared<ExecTool>(exec_timeout_seconds_, workspace_, restrict_to_workspace_));
     tools_.register_tool(std::make_shared<WebSearchTool>(brave_api_key_, 5));
     tools_.register_tool(std::make_shared<WebFetchTool>());
+    if (!trim(transcribe_api_base_).empty()) {
+      tools_.register_tool(std::make_shared<TranscribeTool>(transcribe_api_key_, transcribe_api_base_,
+                                                            transcribe_model_, transcribe_timeout_seconds_));
+    }
     tools_.register_tool(std::make_shared<SystemInspectTool>());
     tools_.register_tool(std::make_shared<AppControlTool>());
     screen_capture_tool_ = std::make_shared<ScreenCaptureTool>(false);
@@ -275,9 +305,9 @@ class AgentLoop {
     }
   }
 
-  std::pair<std::string, std::vector<std::string>> run_agent_loop(const json& initial_messages,
-                                                                   const std::string& channel,
-                                                                   const std::string& chat_id) {
+  std::pair<std::string, std::vector<std::string>> run_agent_loop(
+      const json& initial_messages, const std::string& channel, const std::string& chat_id,
+      const std::function<void(const std::string&)>& on_stream_delta) {
     json messages = initial_messages;
     std::vector<std::string> tools_used;
     std::string final_content;
@@ -289,8 +319,16 @@ class AgentLoop {
         break;
       }
 
-      const LLMResponse resp =
-          provider_->chat(messages, tools_.definitions(), model_, max_tokens_, temperature_, top_p_);
+      std::string stream_buffer;
+      const LLMResponse resp = on_stream_delta
+                                   ? provider_->chat_stream(
+                                         messages, tools_.definitions(), model_, max_tokens_, temperature_, top_p_,
+                                         [&](const std::string& piece) { stream_buffer += piece; })
+                                   : provider_->chat(messages, tools_.definitions(), model_, max_tokens_,
+                                                     temperature_, top_p_);
+      if (on_stream_delta && !resp.has_tool_calls() && !stream_buffer.empty()) {
+        on_stream_delta(stream_buffer);
+      }
       if (!trim(resp.content).empty()) {
         last_assistant_content = resp.content;
       }
@@ -340,8 +378,9 @@ class AgentLoop {
     return {final_content, tools_used};
   }
 
-  std::optional<OutboundMessage> process_message(const InboundMessage& msg,
-                                                 std::optional<std::string> session_override) {
+  std::optional<OutboundMessage> process_message(
+      const InboundMessage& msg, std::optional<std::string> session_override,
+      const std::function<void(const std::string&)>& on_stream_delta) {
     if (msg.channel == "system" && msg.content == "stop") {
       return std::nullopt;
     }
@@ -362,7 +401,9 @@ class AgentLoop {
     }
     if (to_lower(command) == "/help") {
       return OutboundMessage{msg.channel, msg.chat_id,
-                             "AttoClaw commands:\n/new - Start a new conversation\n/stop - Stop current task\n/help - Show commands"};
+                             "AttoClaw commands:\n/new - Start a new conversation\n/stop - Stop current task\n/help - Show commands\n\n"
+                             "Message suffixes:\n--codex - Route this prompt to Codex CLI\n--gemini - Route this prompt to Gemini CLI\n"
+                             "--vision - Enable screen context (can be combined as: <prompt> --vision --codex)"};
     }
     if (to_lower(command) == "/stop") {
       if (!task_in_progress_.load()) {
@@ -376,8 +417,90 @@ class AgentLoop {
       consolidate_memory(session, false);
     }
 
-    std::string user_content = msg.content;
-    const bool vision_enabled = strip_vision_flag(user_content);
+    const ParsedExternalRequest parsed = parse_external_request(msg.content);
+    std::string user_content = parsed.prompt;
+
+    if (!msg.media.empty() && !trim(transcribe_api_base_).empty()) {
+      std::ostringstream media_block;
+      media_block << "\n\n[Media attachments]\n";
+      int idx = 1;
+      for (const auto& p : msg.media) {
+        if (trim(p).empty()) {
+          continue;
+        }
+        media_block << "- audio[" << idx << "]: " << p << "\n";
+        ++idx;
+      }
+
+      std::ostringstream transcript_block;
+      transcript_block << "\n[Transcription]\n";
+      TranscribeTool transcriber(transcribe_api_key_, transcribe_api_base_, transcribe_model_,
+                                 transcribe_timeout_seconds_);
+      idx = 1;
+      for (const auto& p : msg.media) {
+        if (trim(p).empty()) {
+          continue;
+        }
+        fs::path audio_path = expand_user_path(p);
+#ifndef _WIN32
+        if (!audio_path.has_extension() || audio_path.extension() != ".wav") {
+          if (!command_exists_in_path("ffmpeg")) {
+            std::string note;
+            try_install_linux_package("ffmpeg", 240, &note);
+          }
+          if (command_exists_in_path("ffmpeg")) {
+            const fs::path out_dir = expand_user_path("~/.attoclaw") / "inbox" / "converted";
+            std::error_code ec;
+            fs::create_directories(out_dir, ec);
+            const fs::path out = out_dir / (audio_path.stem().string() + "_" + std::to_string(now_ms()) + ".wav");
+            const std::string in_q = sh_single_quote(fs::absolute(audio_path).string());
+            const std::string out_q = sh_single_quote(fs::absolute(out).string());
+            const std::string cmd =
+                "sh -lc \"ffmpeg -y -hide_banner -loglevel error -i " + in_q + " -ac 1 -ar 16000 " + out_q + "\"";
+            const CommandResult conv = run_command_capture(cmd, 240);
+            if (conv.ok && fs::exists(out, ec)) {
+              audio_path = out;
+            }
+          }
+        }
+#endif
+
+        metrics().inc("transcribe.total");
+        const std::string t = transcriber.execute(json{{"path", audio_path.string()}});
+        if (t.rfind("Error:", 0) == 0) {
+          metrics().inc("transcribe.error");
+        } else {
+          metrics().inc("transcribe.ok");
+        }
+        transcript_block << "- audio[" << idx << "]:\n" << t << "\n";
+        ++idx;
+      }
+
+      if (user_content.empty()) {
+        user_content = trim(msg.content);
+      }
+      user_content = trim(user_content + media_block.str() + transcript_block.str());
+    }
+    if (parsed.vision_enabled && is_headless_server()) {
+      return OutboundMessage{msg.channel, msg.chat_id,
+                             "Vision is unavailable on headless server (DISPLAY/WAYLAND_DISPLAY not set)."};
+    }
+
+    if (parsed.external_cli.has_value()) {
+      const std::string final_content = run_external_cli(*parsed.external_cli, workspace_, parsed.vision_enabled);
+      session.add_message("user", parsed.external_cli->prompt.empty() ? trim(msg.content) : parsed.external_cli->prompt);
+      session.add_message("assistant", final_content, {parsed.external_cli->name});
+      sessions_.save(session);
+
+      OutboundMessage out;
+      out.channel = msg.channel;
+      out.chat_id = msg.chat_id;
+      out.content = final_content;
+      out.metadata = msg.metadata;
+      return out;
+    }
+
+    const bool vision_enabled = parsed.vision_enabled;
 
     set_tool_context(msg.channel, msg.chat_id);
     RequestRunScope run_scope(this, vision_enabled);
@@ -385,7 +508,7 @@ class AgentLoop {
     json history = session.get_history(memory_window_);
     json initial_messages = context_.build_messages(history, user_content, {}, msg.channel, msg.chat_id);
 
-    auto [final_content, tools_used] = run_agent_loop(initial_messages, msg.channel, msg.chat_id);
+    auto [final_content, tools_used] = run_agent_loop(initial_messages, msg.channel, msg.chat_id, on_stream_delta);
 
     session.add_message("user", user_content);
     session.add_message("assistant", final_content, tools_used);
@@ -419,13 +542,50 @@ class AgentLoop {
     json initial = context_.build_messages(session.get_history(memory_window_), msg.content, {}, origin_channel,
                                            origin_chat_id);
 
-    auto [final_content, _tools] = run_agent_loop(initial, origin_channel, origin_chat_id);
+    auto [final_content, _tools] = run_agent_loop(initial, origin_channel, origin_chat_id, {});
 
     session.add_message("user", "[System] " + msg.content);
     session.add_message("assistant", final_content);
     sessions_.save(session);
 
     return OutboundMessage{origin_channel, origin_chat_id, final_content};
+  }
+
+  std::string drain_system_announcements(const std::string& origin_channel, const std::string& origin_chat_id) {
+    if (!bus_) {
+      return "";
+    }
+    const std::string target = origin_channel + ":" + origin_chat_id;
+    std::vector<InboundMessage> deferred;
+    std::string appended;
+
+    // Drain a bounded batch to avoid starving other producers.
+    constexpr int kMax = 32;
+    for (int i = 0; i < kMax; ++i) {
+      auto pending = bus_->try_consume_inbound();
+      if (!pending.has_value()) {
+        break;
+      }
+      InboundMessage msg = std::move(*pending);
+      if (msg.channel == "system" && msg.chat_id == target) {
+        auto response = process_system_message(msg);
+        if (response.has_value() && !trim(response->content).empty()) {
+          if (!appended.empty()) {
+            appended += "\n\n";
+          } else {
+            appended = "\n\n";
+          }
+          appended += response->content;
+        }
+      } else {
+        deferred.push_back(std::move(msg));
+      }
+    }
+
+    for (const auto& m : deferred) {
+      bus_->publish_inbound(m);
+    }
+    return appended;
   }
 
   void consolidate_memory(Session& session, bool archive_all) {
@@ -468,27 +628,6 @@ class AgentLoop {
   static std::string to_upper(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     return s;
-  }
-
-  static bool strip_vision_flag(std::string& text) {
-    bool found = false;
-    const std::string token = "--vision";
-    std::size_t pos = 0;
-    while ((pos = text.find(token, pos)) != std::string::npos) {
-      const bool left_ok = pos == 0 || std::isspace(static_cast<unsigned char>(text[pos - 1])) != 0;
-      const std::size_t end = pos + token.size();
-      const bool right_ok = end >= text.size() || std::isspace(static_cast<unsigned char>(text[end])) != 0;
-      if (left_ok && right_ok) {
-        text.erase(pos, token.size());
-        found = true;
-      } else {
-        pos = end;
-      }
-    }
-    if (found) {
-      text = trim(text);
-    }
-    return found;
   }
 
   bool poll_for_stop_signal(const std::string& active_channel, const std::string& active_chat_id) {
@@ -551,6 +690,10 @@ class AgentLoop {
   int max_tokens_;
   int memory_window_;
   std::string brave_api_key_;
+  std::string transcribe_api_key_;
+  std::string transcribe_api_base_;
+  std::string transcribe_model_;
+  int transcribe_timeout_seconds_{180};
   int exec_timeout_seconds_;
   bool restrict_to_workspace_;
 
@@ -575,4 +718,3 @@ class AgentLoop {
 };
 
 }  // namespace attoclaw
-

@@ -4,6 +4,8 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <vector>
+#include <filesystem>
 
 #include "attoclaw/channels.hpp"
 #include "attoclaw/config.hpp"
@@ -48,18 +50,22 @@ class TelegramChannel : public BaseChannel {
     if (trim(token_).empty()) {
       return;
     }
-    HttpClient client;
-    json payload = {
-        {"chat_id", msg.chat_id},
-        {"text", msg.content},
-    };
+    constexpr std::size_t kLimit = 3900;
+    thread_local HttpClient client;
     const std::string url = api_base() + "/sendMessage";
-    HttpResponse resp =
-        client.post(url, payload.dump(), {{"Content-Type", "application/json"}}, 15, true, 3);
-    if (!resp.error.empty() || resp.status < 200 || resp.status >= 300) {
-      Logger::log(Logger::Level::kWarn,
-                  "Telegram send failed: " +
-                      (!resp.error.empty() ? resp.error : ("HTTP " + std::to_string(resp.status))));
+    for (const auto& part : chunk_text(msg.content, kLimit)) {
+      json payload = {
+          {"chat_id", msg.chat_id},
+          {"text", part},
+      };
+      HttpResponse resp =
+          client.post(url, payload.dump(), {{"Content-Type", "application/json"}}, 15, true, 3);
+      if (!resp.error.empty() || resp.status < 200 || resp.status >= 300) {
+        Logger::log(Logger::Level::kWarn,
+                    "Telegram send failed: " +
+                        (!resp.error.empty() ? resp.error : ("HTTP " + std::to_string(resp.status))));
+        break;
+      }
     }
   }
 
@@ -125,9 +131,6 @@ class TelegramChannel : public BaseChannel {
     } else if (message.contains("caption") && message["caption"].is_string()) {
       content = message["caption"].get<std::string>();
     }
-    if (trim(content).empty()) {
-      return;
-    }
 
     std::string sender_id = from.contains("id") ? json_to_string(from["id"]) : "";
     std::string chat_id;
@@ -138,7 +141,83 @@ class TelegramChannel : public BaseChannel {
       return;
     }
 
-    handle_message(sender_id, chat_id, content);
+    std::vector<std::string> media_paths;
+    json meta = json::object();
+
+    // Voice note / audio attachments.
+    std::string file_id;
+    std::string kind;
+    if (message.contains("voice") && message["voice"].is_object()) {
+      file_id = message["voice"].value("file_id", "");
+      kind = "voice";
+      meta["voice"] = message["voice"];
+    } else if (message.contains("audio") && message["audio"].is_object()) {
+      file_id = message["audio"].value("file_id", "");
+      kind = "audio";
+      meta["audio"] = message["audio"];
+    } else if (message.contains("document") && message["document"].is_object()) {
+      const std::string mime = message["document"].value("mime_type", "");
+      if (mime.rfind("audio/", 0) == 0) {
+        file_id = message["document"].value("file_id", "");
+        kind = "document_audio";
+        meta["document"] = message["document"];
+      }
+    }
+
+    if (!trim(file_id).empty()) {
+      if (auto local = download_file(file_id, chat_id)) {
+        media_paths.push_back(local->string());
+        if (trim(content).empty()) {
+          content = "Voice note received (" + kind + "). Please transcribe and respond.";
+        }
+      }
+    }
+
+    if (trim(content).empty() && media_paths.empty()) {
+      return;
+    }
+
+    handle_message(sender_id, chat_id, content, media_paths, meta);
+  }
+
+  std::optional<fs::path> download_file(const std::string& file_id, const std::string& chat_id) const {
+    HttpClient client;
+    const std::string url = api_base() + "/getFile?file_id=" + file_id;
+    HttpResponse resp = client.get(url, {}, 20, true, 3);
+    if (!resp.error.empty() || resp.status < 200 || resp.status >= 300) {
+      Logger::log(Logger::Level::kWarn, "Telegram getFile failed");
+      return std::nullopt;
+    }
+
+    try {
+      const json body = json::parse(resp.body);
+      if (!body.value("ok", false) || !body.contains("result") || !body["result"].is_object()) {
+        return std::nullopt;
+      }
+      const json result = body["result"];
+      const std::string file_path = result.value("file_path", "");
+      if (trim(file_path).empty()) {
+        return std::nullopt;
+      }
+
+      const fs::path base_dir = expand_user_path("~/.attoclaw") / "inbox" / "telegram" / chat_id;
+      std::error_code ec;
+      fs::create_directories(base_dir, ec);
+      fs::path out = base_dir / fs::path(file_path).filename();
+      if (out.extension().empty()) {
+        out += ".bin";
+      }
+
+      const std::string file_url = "https://api.telegram.org/file/bot" + token_ + "/" + file_path;
+      HttpResponse dl = client.download_to_file(file_url, {}, out, 60, true, 3);
+      if (!dl.error.empty() || dl.status < 200 || dl.status >= 300) {
+        Logger::log(Logger::Level::kWarn, "Telegram file download failed");
+        return std::nullopt;
+      }
+      return fs::absolute(out);
+    } catch (...) {
+      return std::nullopt;
+    }
   }
 
   void poll_loop() {
@@ -195,5 +274,3 @@ class TelegramChannel : public BaseChannel {
 };
 
 }  // namespace attoclaw
-
-
