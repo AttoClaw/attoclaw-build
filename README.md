@@ -1,7 +1,7 @@
 # [AttoClaw](https://attoclaw.github.io/)
 
 <p align="center">
-<img src="./attoclaw.png" alt="AttoClaw Logo" width="512"/>
+<img src="./attoclaw.png" alt="AttoClaw Logo" width="728" height="256"/>
 </p>
 
 AttoClaw is a high-performance C++ port of openclaw focused on low overhead, deterministic runtime behavior, and practical local automation.
