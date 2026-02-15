@@ -5,18 +5,79 @@ on:
   pull_request:
 
 jobs:
-  build-linux:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install deps
+      - name: Install deps (Ubuntu)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake g++ libcurl4-openssl-dev pkg-config
-      - name: Configure
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install cmake curl pkg-config
+
+      - name: Install deps (Windows via vcpkg)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkg = Join-Path $env:RUNNER_TEMP "vcpkg"
+          if (!(Test-Path $vcpkg)) {
+            git clone --depth 1 https://github.com/microsoft/vcpkg $vcpkg
+          }
+          & (Join-Path $vcpkg "bootstrap-vcpkg.bat")
+          & (Join-Path $vcpkg "vcpkg.exe") install curl[core,openssl]:x64-windows
+          "VCPKG_ROOT=$vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure (Linux/macOS)
+        if: runner.os != 'Windows'
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-      - name: Build
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\\scripts\\buildsystems\\vcpkg.cmake"
+
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
         run: cmake --build build -j
-      - name: Test
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release
+
+      - name: Test (Linux/macOS)
+        if: runner.os != 'Windows'
         run: ctest --test-dir build --output-on-failure
 
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Collect binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp build/Release/attoclaw.exe dist/attoclaw-windows-x64.exe
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            cp build/attoclaw dist/attoclaw-macos
+          else
+            cp build/attoclaw dist/attoclaw-linux
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: attoclaw-${{ runner.os }}
+          path: dist/*
