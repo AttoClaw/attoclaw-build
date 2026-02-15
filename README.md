@@ -11,6 +11,23 @@ This repo currently builds a single binary:
 - `attoclaw.exe` (Windows)
 - `attoclaw` (Linux/macOS)
 
+## Why AttoClaw
+
+AttoClaw is built for minimal runtime overhead: fast startup, low memory usage, and a very small binary for constrained systems.
+
+### Measured local stats (current build: `attoclaw v0.1.0`)
+
+| Metric | Result |
+|---|---|
+| Binary size (`attoclaw.exe`) | `768,512 bytes` (`750.5 KB`, `0.733 MB`) |
+| Startup time (`--version`, avg of 10 runs) | `37.89 ms` |
+| Startup time (`status`, avg of 5 runs) | `44.88 ms` |
+| Single-turn agent time (mock local LLM, avg of 5 runs) | `64.57 ms` |
+| Peak RAM (`status`, avg) | `1.46 MB` |
+| Peak RAM (`single-turn agent`, avg) | `4.44 MB` |
+
+*These are initial, non-final benchmarking numbers and do not represent a stable cross-system comparison.*
+
 ## Current scope
 
 Implemented and stable:
