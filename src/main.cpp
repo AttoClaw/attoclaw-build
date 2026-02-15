@@ -12,8 +12,12 @@
 #include "attoclaw/channels.hpp"
 #include "attoclaw/config.hpp"
 #include "attoclaw/cron.hpp"
+#include "attoclaw/discord_channel.hpp"
+#include "attoclaw/email_channel.hpp"
 #include "attoclaw/heartbeat.hpp"
+#include "attoclaw/metrics.hpp"
 #include "attoclaw/provider.hpp"
+#include "attoclaw/slack_channel.hpp"
 #include "attoclaw/telegram_channel.hpp"
 #include "attoclaw/vision.hpp"
 #include "attoclaw/whatsapp_channel.hpp"
@@ -28,10 +32,15 @@ void print_usage() {
       << "Usage:\n"
       << "  attoclaw onboard\n"
       << "  attoclaw status\n"
-      << "  attoclaw agent [-m MESSAGE] [-s SESSION] [--vision] [--vision-fps FPS] [--vision-frames N]\n"
+      << "  attoclaw doctor [--json]\n"
+      << "  attoclaw agent [-m MESSAGE] [-s SESSION] [--stream] [--vision] [--vision-fps FPS] [--vision-frames N]\n"
+      << "  attoclaw dashboard [--host HOST] [--port PORT]\n"
       << "  attoclaw gateway\n"
       << "  attoclaw channels status\n"
       << "  attoclaw channels login\n"
+      << "  attoclaw send --channel CHANNEL --to DEST --message TEXT\n"
+      << "  attoclaw transcribe --file AUDIO_PATH\n"
+      << "  attoclaw metrics [--json]\n"
       << "  attoclaw cron list\n"
       << "  attoclaw cron add --name NAME --message MSG [--every SECONDS | --cron EXPR | --at ISO]\n"
       << "  attoclaw cron remove JOB_ID\n"
@@ -71,6 +80,70 @@ bool command_exists(const std::string& command) {
 #endif
   const CommandResult out = run_command_capture(probe, 10);
   return out.ok && !trim(out.output).empty();
+}
+
+std::optional<fs::path> find_dashboard_script(const fs::path& argv0_path) {
+  std::vector<fs::path> candidates;
+  candidates.push_back(fs::current_path() / "scripts" / "dashboard_server.py");
+  if (!argv0_path.empty()) {
+    const fs::path exe_dir = argv0_path.parent_path();
+    candidates.push_back(exe_dir / "scripts" / "dashboard_server.py");
+    candidates.push_back(exe_dir.parent_path() / "scripts" / "dashboard_server.py");
+  }
+
+  for (const auto& p : candidates) {
+    std::error_code ec;
+    if (fs::exists(p, ec)) {
+      return fs::absolute(p);
+    }
+  }
+  return std::nullopt;
+}
+
+int run_dashboard(const std::vector<std::string>& args, const fs::path& argv0_path) {
+  const std::string host = trim(get_flag_value(args, "--host", "127.0.0.1"));
+  const int port = get_int_flag_value(args, "--port", 8787, 1, 65535);
+
+  const auto script = find_dashboard_script(argv0_path);
+  if (!script.has_value()) {
+    std::cerr << "Dashboard script not found (expected scripts/dashboard_server.py).\n";
+    return 1;
+  }
+
+#ifdef _WIN32
+  std::string python = command_exists("python") ? "python" : (command_exists("py") ? "py -3" : "");
+#else
+  std::string python = command_exists("python3") ? "python3" : (command_exists("python") ? "python" : "");
+#endif
+
+  if (python.empty()) {
+#ifdef _WIN32
+    std::cerr << "Python is required for dashboard. Install Python 3 and retry.\n";
+    return 1;
+#else
+    if (command_exists("pkg")) {
+      std::cout << "Python not found. Attempting auto-install via pkg...\n";
+      const CommandResult install = run_command_capture("pkg install -y python", 300);
+      if (!install.ok) {
+        std::cerr << "Failed to install python automatically.\n" << install.output << "\n";
+        return 1;
+      }
+      python = command_exists("python3") ? "python3" : (command_exists("python") ? "python" : "");
+    }
+    if (python.empty()) {
+      std::cerr << "Python is required for dashboard. Install python3 and retry.\n";
+      return 1;
+    }
+#endif
+  }
+
+  const fs::path bin_path = fs::absolute(argv0_path.empty() ? fs::path("attoclaw") : argv0_path);
+  const std::string command = python + " \"" + script->string() + "\" --host \"" + host + "\" --port " +
+                              std::to_string(port) + " --bin \"" + bin_path.string() + "\"";
+
+  std::cout << "Starting AttoClaw dashboard at http://" << host << ":" << port << "\n";
+  std::cout << "Press Ctrl+C to stop.\n";
+  return std::system(command.c_str()) == 0 ? 0 : 1;
 }
 
 bool install_tesseract_onboard() {
@@ -137,7 +210,8 @@ bool ensure_home_bridge(const fs::path& bridge_dir) {
       {bridge_dir / "package.json",
        R"({
   "name": "attoclaw-whatsapp-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "attoclawBridgeSchema": 2,
   "description": "WhatsApp bridge for AttoClaw using Baileys",
   "type": "module",
   "main": "dist/index.js",
@@ -163,6 +237,7 @@ bool ensure_home_bridge(const fs::path& bridge_dir) {
 })"},
       {bridge_dir / "tsconfig.json",
        R"({
+  "attoclawBridgeSchema": 2,
   "compilerOptions": {
     "target": "ES2022",
     "module": "NodeNext",
@@ -178,6 +253,7 @@ bool ensure_home_bridge(const fs::path& bridge_dir) {
 })"},
       {src_dir / "index.ts",
        R"(#!/usr/bin/env node
+// attoclaw-bridge-schema:2
 import { webcrypto } from 'crypto';
 if (!globalThis.crypto) {
   (globalThis as any).crypto = webcrypto;
@@ -189,12 +265,13 @@ import { join } from 'path';
 
 const PORT = parseInt(process.env.BRIDGE_PORT || '3001', 10);
 const AUTH_DIR = process.env.AUTH_DIR || join(homedir(), '.attoclaw', 'whatsapp-auth');
+const MEDIA_DIR = process.env.MEDIA_DIR || join(homedir(), '.attoclaw', 'whatsapp-media');
 const TOKEN = process.env.BRIDGE_TOKEN || undefined;
 
 console.log('AttoClaw WhatsApp Bridge');
 console.log('=======================\n');
 
-const server = new BridgeServer(PORT, AUTH_DIR, TOKEN);
+const server = new BridgeServer(PORT, AUTH_DIR, MEDIA_DIR, TOKEN);
 
 process.on('SIGINT', async () => {
   console.log('\n\nShutting down...');
@@ -213,7 +290,8 @@ server.start().catch((error) => {
 });
 )"},
       {src_dir / "server.ts",
-       R"(import { WebSocketServer, WebSocket } from 'ws';
+       R"(// attoclaw-bridge-schema:2
+import { WebSocketServer, WebSocket } from 'ws';
 import { WhatsAppClient } from './whatsapp.js';
 
 interface SendCommand {
@@ -232,7 +310,7 @@ export class BridgeServer {
   private wa: WhatsAppClient | null = null;
   private clients: Set<WebSocket> = new Set();
 
-  constructor(private port: number, private authDir: string, private token?: string) {}
+  constructor(private port: number, private authDir: string, private mediaDir: string, private token?: string) {}
 
   async start(): Promise<void> {
     this.wss = new WebSocketServer({ host: '127.0.0.1', port: this.port });
@@ -241,6 +319,7 @@ export class BridgeServer {
 
     this.wa = new WhatsAppClient({
       authDir: this.authDir,
+      mediaDir: this.mediaDir,
       onMessage: (msg) => this.broadcast({ type: 'message', ...msg }),
       onQR: (qr) => this.broadcast({ type: 'qr', qr }),
       onStatus: (status) => this.broadcast({ type: 'status', status }),
@@ -331,13 +410,18 @@ export class BridgeServer {
 }
 )"},
       {src_dir / "whatsapp.ts",
-       R"(/* eslint-disable @typescript-eslint/no-explicit-any */
+       R"(/* attoclaw-bridge-schema:2 */
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  downloadContentFromMessage,
 } from '@whiskeysockets/baileys';
+
+import { createWriteStream, promises as fsp } from 'fs';
+import { join } from 'path';
 
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
@@ -352,10 +436,12 @@ export interface InboundMessage {
   content: string;
   timestamp: number;
   isGroup: boolean;
+  media?: { path: string; mimetype?: string; filename?: string }[];
 }
 
 export interface WhatsAppClientOptions {
   authDir: string;
+  mediaDir: string;
   onMessage: (msg: InboundMessage) => void;
   onQR: (qr: string) => void;
   onStatus: (status: string) => void;
@@ -435,8 +521,12 @@ export class WhatsAppClient {
         if (msg.key.fromMe) continue;
         if (msg.key.remoteJid === 'status@broadcast') continue;
 
-        const content = this.extractMessageContent(msg);
-        if (!content) continue;
+        const media = await this.extractAudioMedia(msg);
+        let content = this.extractMessageContent(msg);
+        if (!content && media && media.length) {
+          content = '[Voice Message]';
+        }
+        if (!content && (!media || !media.length)) continue;
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
 
@@ -444,10 +534,69 @@ export class WhatsAppClient {
           id: msg.key.id || '',
           sender: msg.key.remoteJid || '',
           pn: msg.key.remoteJidAlt || '',
-          content,
+          content: content || '',
           timestamp: msg.messageTimestamp as number,
           isGroup,
+          media: media || undefined,
         });
+      }
+    });
+  }
+
+  private async extractAudioMedia(msg: any): Promise<{ path: string; mimetype?: string; filename?: string }[] | null> {
+    const message = msg.message;
+    if (!message) return null;
+
+    let mediaMsg: any = null;
+    let dlType: 'audio' | 'document' = 'audio';
+    let mimetype = '';
+
+    if (message.audioMessage) {
+      mediaMsg = message.audioMessage;
+      dlType = 'audio';
+      mimetype = mediaMsg.mimetype || '';
+    } else if (message.documentMessage && (message.documentMessage.mimetype || '').startsWith('audio/')) {
+      mediaMsg = message.documentMessage;
+      dlType = 'document';
+      mimetype = mediaMsg.mimetype || '';
+    } else {
+      return null;
+    }
+
+    await fsp.mkdir(this.options.mediaDir, { recursive: true });
+
+    const ext = this.extFromMime(mimetype) || (dlType === 'audio' ? '.ogg' : '.bin');
+    const filename = `wa_${Date.now()}_${Math.floor(Math.random() * 1e6)}${ext}`;
+    const outPath = join(this.options.mediaDir, filename);
+
+    const stream = await downloadContentFromMessage(mediaMsg, dlType);
+    await this.writeAsyncIterableToFile(stream, outPath);
+
+    return [{ path: outPath, mimetype, filename }];
+  }
+
+  private extFromMime(m: string): string | null {
+    const mm = (m || '').toLowerCase();
+    if (mm.includes('ogg') || mm.includes('opus')) return '.ogg';
+    if (mm.includes('mpeg') || mm.includes('mp3')) return '.mp3';
+    if (mm.includes('wav')) return '.wav';
+    if (mm.includes('mp4') || mm.includes('m4a')) return '.m4a';
+    return null;
+  }
+
+  private async writeAsyncIterableToFile(iter: AsyncIterable<Buffer>, outPath: string): Promise<void> {
+    await new Promise<void>(async (resolve, reject) => {
+      const ws = createWriteStream(outPath);
+      ws.on('error', reject);
+      ws.on('finish', () => resolve());
+      try {
+        for await (const chunk of iter) {
+          ws.write(chunk);
+        }
+        ws.end();
+      } catch (e) {
+        ws.destroy();
+        reject(e);
       }
     });
   }
@@ -471,9 +620,6 @@ export class WhatsAppClient {
     if (message.documentMessage?.caption) {
       return `[Document] ${message.documentMessage.caption}`;
     }
-    if (message.audioMessage) {
-      return '[Voice Message]';
-    }
 
     return null;
   }
@@ -494,7 +640,8 @@ export class WhatsAppClient {
 }
 )"},
       {src_dir / "types.d.ts",
-       R"(declare module 'qrcode-terminal' {
+       R"(// attoclaw-bridge-schema:2
+declare module 'qrcode-terminal' {
   interface QRCodeTerminal {
     generate(text: string, opts?: { small?: boolean }): void;
   }
@@ -504,8 +651,23 @@ export class WhatsAppClient {
 )"},
   };
 
+  auto needs_write = [](const fs::path& path) -> bool {
+    std::error_code ec;
+    if (!fs::exists(path, ec)) {
+      return true;
+    }
+    const std::string raw = read_text_file(path);
+    if (raw.find("attoclaw-bridge-schema:2") != std::string::npos) {
+      return false;
+    }
+    if (raw.find("\"attoclawBridgeSchema\": 2") != std::string::npos) {
+      return false;
+    }
+    return true;
+  };
+
   for (const auto& [path, content] : files) {
-    if (!fs::exists(path)) {
+    if (needs_write(path)) {
       if (!write_text_file(path, content)) {
         return false;
       }
@@ -594,6 +756,221 @@ int run_status() {
   return 0;
 }
 
+std::string mask_secret(const std::string& s) {
+  if (s.empty()) {
+    return "";
+  }
+  if (s.size() <= 6) {
+    return "***";
+  }
+  return s.substr(0, 3) + "***" + s.substr(s.size() - 3);
+}
+
+int run_doctor(const std::vector<std::string>& args) {
+  const bool json_out = has_flag(args, "--json");
+  const fs::path config_path = get_config_path();
+  Config cfg = load_config(config_path);
+
+  json report = json::object();
+  report["time"] = now_iso8601();
+  report["configPath"] = config_path.string();
+  report["configExists"] = fs::exists(config_path);
+
+  json problems = json::array();
+  json notes = json::array();
+
+  const bool provider_ok = !trim(cfg.provider.api_base).empty() && !trim(cfg.provider.api_key).empty();
+  report["providerBase"] = cfg.provider.api_base;
+  report["providerKeySet"] = !trim(cfg.provider.api_key).empty();
+  if (!report["configExists"].get<bool>()) {
+    problems.push_back("Config is missing. Run: attoclaw onboard");
+  }
+  if (!provider_ok) {
+    problems.push_back("Provider API key/base not configured (set providers.*.apiKey/apiBase or env vars).");
+  }
+
+  // Channel sanity checks.
+  if (cfg.channels.telegram.enabled && trim(cfg.channels.telegram.token).empty()) {
+    problems.push_back("Telegram enabled but channels.telegram.token is empty.");
+  }
+  if (cfg.channels.whatsapp.enabled && trim(cfg.channels.whatsapp.bridge_url).empty()) {
+    problems.push_back("WhatsApp enabled but channels.whatsapp.bridgeUrl is empty.");
+  }
+  if (cfg.channels.slack.enabled) {
+    if (trim(cfg.channels.slack.token).empty()) problems.push_back("Slack enabled but channels.slack.token is empty.");
+    if (cfg.channels.slack.channels.empty()) problems.push_back("Slack enabled but channels.slack.channels is empty.");
+  }
+  if (cfg.channels.discord.enabled) {
+    if (trim(cfg.channels.discord.token).empty()) problems.push_back("Discord enabled but channels.discord.token is empty.");
+    if (cfg.channels.discord.channels.empty()) problems.push_back("Discord enabled but channels.discord.channels is empty.");
+  }
+  if (cfg.channels.email.enabled) {
+    if (trim(cfg.channels.email.smtp_url).empty()) problems.push_back("Email enabled but channels.email.smtpUrl is empty.");
+    if (trim(cfg.channels.email.from).empty()) problems.push_back("Email enabled but channels.email.from is empty.");
+  }
+
+  // Voice transcription.
+  const std::string transcribe_base =
+      !trim(cfg.tools.transcribe.api_base).empty() ? cfg.tools.transcribe.api_base : cfg.provider.api_base;
+  const std::string transcribe_key =
+      !trim(cfg.tools.transcribe.api_key).empty() ? cfg.tools.transcribe.api_key : cfg.provider.api_key;
+  report["transcribeBase"] = transcribe_base;
+  report["transcribeKeySet"] = !trim(transcribe_key).empty();
+  if (!trim(transcribe_base).empty() && trim(transcribe_key).empty()) {
+    // Allowed for localhost NIM, but not for remote.
+    if (transcribe_base.find("://localhost") == std::string::npos && transcribe_base.find("://127.0.0.1") == std::string::npos) {
+      problems.push_back("tools.transcribe.apiBase set but no apiKey (ok for localhost NIM, not ok for remote).");
+    } else {
+      notes.push_back("Transcription configured for localhost NIM (no API key required).");
+    }
+  }
+
+  // Dependencies.
+  report["deps"] = json::object();
+  report["deps"]["npm"] = command_exists("npm");
+  report["deps"]["node"] = command_exists("node");
+  report["deps"]["codex"] = command_exists("codex");
+  report["deps"]["gemini"] = command_exists("gemini");
+  report["deps"]["ffmpeg"] = command_exists("ffmpeg");
+  report["deps"]["tesseract"] = command_exists("tesseract");
+
+  if (cfg.channels.whatsapp.enabled && !command_exists("npm")) {
+    problems.push_back("WhatsApp enabled but npm is missing (required for bridge).");
+  }
+
+  report["problems"] = problems;
+  report["notes"] = notes;
+  report["ok"] = problems.empty();
+
+  if (json_out) {
+    std::cout << report.dump(2) << "\n";
+    return problems.empty() ? 0 : 2;
+  }
+
+  std::cout << "AttoClaw Doctor\n\n";
+  std::cout << "Config: " << config_path.string() << (fs::exists(config_path) ? " [ok]" : " [missing]") << "\n";
+  std::cout << "Provider base: " << cfg.provider.api_base << "\n";
+  std::cout << "Provider key: " << (trim(cfg.provider.api_key).empty() ? "not set" : mask_secret(cfg.provider.api_key)) << "\n";
+  std::cout << "Transcribe base: " << transcribe_base << "\n";
+  std::cout << "Transcribe key: " << (trim(transcribe_key).empty() ? "not set" : mask_secret(transcribe_key)) << "\n\n";
+
+  if (!notes.empty()) {
+    std::cout << "Notes:\n";
+    for (const auto& n : notes) {
+      if (n.is_string()) std::cout << "- " << n.get<std::string>() << "\n";
+    }
+    std::cout << "\n";
+  }
+
+  if (problems.empty()) {
+    std::cout << "No problems detected.\n";
+    return 0;
+  }
+
+  std::cout << "Problems:\n";
+  for (const auto& p : problems) {
+    if (p.is_string()) std::cout << "- " << p.get<std::string>() << "\n";
+  }
+  return 2;
+}
+
+int run_metrics(const std::vector<std::string>& args) {
+  const bool json_out = has_flag(args, "--json");
+  const fs::path path = default_metrics_path();
+  const std::string raw = read_text_file(path);
+  if (json_out) {
+    if (trim(raw).empty()) {
+      std::cout << "{}\n";
+    } else {
+      std::cout << raw << "\n";
+    }
+    return 0;
+  }
+  std::cout << (trim(raw).empty() ? "(no metrics snapshot yet)\n" : raw + "\n");
+  return 0;
+}
+
+int run_send(const std::vector<std::string>& args) {
+  const std::string channel = trim(get_flag_value(args, "--channel"));
+  const std::string to = trim(get_flag_value(args, "--to"));
+  const std::string message = get_flag_value(args, "--message");
+  if (channel.empty() || to.empty() || trim(message).empty()) {
+    std::cerr << "Usage: attoclaw send --channel CHANNEL --to DEST --message TEXT\n";
+    return 1;
+  }
+
+  Config cfg = load_config();
+  MessageBus bus;
+  OutboundMessage msg;
+  msg.channel = channel;
+  msg.chat_id = to;
+  msg.content = message;
+
+  if (channel == "telegram") {
+    TelegramChannel tg(cfg.channels.telegram, &bus);
+    tg.send(msg);
+    return 0;
+  }
+  if (channel == "slack") {
+    SlackChannel s(cfg.channels.slack, &bus);
+    s.send(msg);
+    return 0;
+  }
+  if (channel == "discord") {
+    DiscordChannel d(cfg.channels.discord, &bus);
+    d.send(msg);
+    return 0;
+  }
+  if (channel == "email") {
+    EmailChannel e(cfg.channels.email, &bus);
+    e.start();
+    e.send(msg);
+    e.stop();
+    return 0;
+  }
+  if (channel == "whatsapp") {
+    WhatsAppChannel wa(cfg.channels.whatsapp, &bus);
+    wa.start();
+    wa.send(msg);
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    wa.stop();
+    return 0;
+  }
+
+  std::cerr << "Unknown channel: " << channel << "\n";
+  return 1;
+}
+
+int run_transcribe(const std::vector<std::string>& args) {
+  const std::string file = trim(get_flag_value(args, "--file", get_flag_value(args, "-f")));
+  if (file.empty()) {
+    std::cerr << "Usage: attoclaw transcribe --file AUDIO_PATH [--language LANG] [--prompt TEXT]\n";
+    return 1;
+  }
+
+  Config cfg = load_config();
+  const std::string transcribe_key =
+      !trim(cfg.tools.transcribe.api_key).empty() ? cfg.tools.transcribe.api_key : cfg.provider.api_key;
+  const std::string transcribe_base =
+      !trim(cfg.tools.transcribe.api_base).empty() ? cfg.tools.transcribe.api_base : cfg.provider.api_base;
+
+  TranscribeTool tool(transcribe_key, transcribe_base, cfg.tools.transcribe.model, cfg.tools.transcribe.timeout);
+  json params = {{"path", file}};
+
+  const std::string language = trim(get_flag_value(args, "--language", ""));
+  if (!language.empty()) {
+    params["language"] = language;
+  }
+  const std::string prompt = trim(get_flag_value(args, "--prompt", ""));
+  if (!prompt.empty()) {
+    params["prompt"] = prompt;
+  }
+
+  const std::string out = tool.execute(params);
+  std::cout << out << "\n";
+  return 0;
+}
+
 int run_agent(const std::vector<std::string>& args) {
   Config cfg = load_config();
   const fs::path workspace = fs::weakly_canonical(expand_user_path(cfg.agent.workspace));
@@ -602,24 +979,33 @@ int run_agent(const std::vector<std::string>& args) {
   MessageBus bus;
   auto provider = make_provider(cfg);
 
+  const std::string transcribe_key =
+      !trim(cfg.tools.transcribe.api_key).empty() ? cfg.tools.transcribe.api_key : cfg.provider.api_key;
+  const std::string transcribe_base =
+      !trim(cfg.tools.transcribe.api_base).empty() ? cfg.tools.transcribe.api_base : cfg.provider.api_base;
+
   AgentLoop agent(&bus, &provider, workspace, cfg.agent.model, cfg.agent.max_tool_iterations,
                   cfg.agent.temperature, cfg.agent.top_p, cfg.agent.max_tokens, cfg.agent.memory_window,
-                  cfg.tools.web_search.api_key, cfg.tools.exec.timeout, cfg.tools.restrict_to_workspace, nullptr);
+                  cfg.tools.web_search.api_key, transcribe_key, transcribe_base, cfg.tools.transcribe.model,
+                  cfg.tools.transcribe.timeout, cfg.tools.exec.timeout, cfg.tools.restrict_to_workspace, nullptr);
 
   const std::string message = get_flag_value(args, "-m", get_flag_value(args, "--message"));
   const std::string session = get_flag_value(args, "-s", get_flag_value(args, "--session", "cli:direct"));
+  const bool stream = has_flag(args, "--stream");
   const bool vision_mode = has_flag(args, "--vision");
   const int vision_fps = get_int_flag_value(args, "--vision-fps", 1, 1, 10);
   const int vision_frames = get_int_flag_value(args, "--vision-frames", 30, 0, 100000);
 
   if (vision_mode) {
     const std::string prompt = message.empty() ? "Analyze what is visible on this screen frame." : message;
-    const int frame_delay_ms = (std::max)(100, 1000 / vision_fps);
 
 #ifndef _WIN32
+    (void)vision_fps;
+    (void)vision_frames;
     std::cerr << "--vision is currently implemented for Windows builds only.\n";
     return 1;
 #else
+    const int frame_delay_ms = (std::max)(100, 1000 / vision_fps);
     std::cout << "Vision mode started (" << vision_fps << " FPS, "
               << (vision_frames == 0 ? std::string("unlimited") : std::to_string(vision_frames))
               << " frames). Press Ctrl+C to stop.\n";
@@ -691,8 +1077,16 @@ int run_agent(const std::vector<std::string>& args) {
   }
 
   if (!message.empty()) {
-    const std::string response = agent.process_direct(message, session, "cli", "direct");
-    std::cout << "\nAttoClaw\n" << response << "\n";
+    std::cout << "\nAttoClaw\n";
+    if (stream) {
+      agent.process_direct_stream(message, [&](const std::string& piece) {
+        std::cout << piece << std::flush;
+      }, session, "cli", "direct");
+      std::cout << "\n";
+    } else {
+      const std::string response = agent.process_direct(message, session, "cli", "direct");
+      std::cout << response << "\n";
+    }
     return 0;
   }
 
@@ -711,8 +1105,15 @@ int run_agent(const std::vector<std::string>& args) {
       break;
     }
 
-    const std::string response = agent.process_direct(line, session, "cli", "direct");
-    std::cout << "\nAttoClaw\n" << response << "\n\n";
+    std::cout << "\nAttoClaw\n";
+    if (stream) {
+      agent.process_direct_stream(line, [&](const std::string& piece) { std::cout << piece << std::flush; },
+                                  session, "cli", "direct");
+      std::cout << "\n\n";
+    } else {
+      const std::string response = agent.process_direct(line, session, "cli", "direct");
+      std::cout << response << "\n\n";
+    }
   }
 
   return 0;
@@ -730,9 +1131,15 @@ int run_gateway() {
   const fs::path cron_store = get_data_dir() / "cron" / "jobs.json";
   CronService cron(cron_store);
 
+  const std::string transcribe_key =
+      !trim(cfg.tools.transcribe.api_key).empty() ? cfg.tools.transcribe.api_key : cfg.provider.api_key;
+  const std::string transcribe_base =
+      !trim(cfg.tools.transcribe.api_base).empty() ? cfg.tools.transcribe.api_base : cfg.provider.api_base;
+
   AgentLoop agent(&bus, &provider, workspace, cfg.agent.model, cfg.agent.max_tool_iterations,
                   cfg.agent.temperature, cfg.agent.top_p, cfg.agent.max_tokens, cfg.agent.memory_window,
-                  cfg.tools.web_search.api_key, cfg.tools.exec.timeout, cfg.tools.restrict_to_workspace, &cron);
+                  cfg.tools.web_search.api_key, transcribe_key, transcribe_base, cfg.tools.transcribe.model,
+                  cfg.tools.transcribe.timeout, cfg.tools.exec.timeout, cfg.tools.restrict_to_workspace, &cron);
 
   cron.set_on_job([&](const CronJob& job) -> std::optional<std::string> {
     const std::string response =
@@ -755,6 +1162,15 @@ int run_gateway() {
   if (cfg.channels.whatsapp.enabled) {
     channel_manager.add_channel(std::make_shared<WhatsAppChannel>(cfg.channels.whatsapp, &bus));
   }
+  if (cfg.channels.slack.enabled) {
+    channel_manager.add_channel(std::make_shared<SlackChannel>(cfg.channels.slack, &bus));
+  }
+  if (cfg.channels.discord.enabled) {
+    channel_manager.add_channel(std::make_shared<DiscordChannel>(cfg.channels.discord, &bus));
+  }
+  if (cfg.channels.email.enabled) {
+    channel_manager.add_channel(std::make_shared<EmailChannel>(cfg.channels.email, &bus));
+  }
 
   const auto enabled_channels = channel_manager.enabled_channels();
   if (!enabled_channels.empty()) {
@@ -776,6 +1192,16 @@ int run_gateway() {
   heartbeat.start();
   agent.run();
 
+  std::atomic<bool> metrics_running{true};
+  std::thread metrics_flush([&]() {
+    while (metrics_running.load()) {
+      write_metrics_snapshot();
+      for (int i = 0; metrics_running.load() && i < 50; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
+  });
+
   std::cout << "AttoClaw gateway started. Press Enter to stop.\n";
   std::string ignored;
   std::getline(std::cin, ignored);
@@ -785,6 +1211,12 @@ int run_gateway() {
   cron.stop();
   channel_manager.stop_all();
   bus.stop_dispatcher();
+
+  metrics_running.store(false);
+  if (metrics_flush.joinable()) {
+    metrics_flush.join();
+  }
+  write_metrics_snapshot();
   return 0;
 }
 
@@ -804,8 +1236,16 @@ int run_channels(const std::vector<std::string>& args) {
               << ", token: " << (cfg.channels.whatsapp.bridge_token.empty() ? "not set" : "set") << ")\n";
     std::cout << "Telegram: " << (cfg.channels.telegram.enabled ? "enabled" : "disabled")
               << " (token: " << (cfg.channels.telegram.token.empty() ? "not set" : "set") << ")\n";
-    std::cout << "\nImplemented adapters: Telegram, WhatsApp bridge.\n";
-    std::cout << "Other channel adapters removed from AttoClaw.\n";
+    std::cout << "Slack: " << (cfg.channels.slack.enabled ? "enabled" : "disabled")
+              << " (token: " << (cfg.channels.slack.token.empty() ? "not set" : "set")
+              << ", channels: " << cfg.channels.slack.channels.size() << ")\n";
+    std::cout << "Discord: " << (cfg.channels.discord.enabled ? "enabled" : "disabled")
+              << " (token: " << (cfg.channels.discord.token.empty() ? "not set" : "set")
+              << ", channels: " << cfg.channels.discord.channels.size() << ")\n";
+    std::cout << "Email: " << (cfg.channels.email.enabled ? "enabled" : "disabled")
+              << " (smtpUrl: " << (cfg.channels.email.smtp_url.empty() ? "not set" : "set")
+              << ", from: " << (cfg.channels.email.from.empty() ? "not set" : "set") << ")\n";
+    std::cout << "\nImplemented adapters: Telegram, WhatsApp bridge, Slack, Discord, Email (outbound).\n";
     return 0;
   }
 
@@ -965,6 +1405,13 @@ int run_cron(const std::vector<std::string>& args) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  {
+    const char* v = std::getenv("ATTOCLAW_LOG_JSON");
+    if (v && *v && std::string(v) != "0") {
+      Logger::set_json(true);
+    }
+  }
+
   std::vector<std::string> args;
   args.reserve(static_cast<std::size_t>(argc));
   for (int i = 0; i < argc; ++i) {
@@ -989,9 +1436,29 @@ int main(int argc, char** argv) {
   if (command == "status") {
     return run_status();
   }
+  if (command == "doctor") {
+    std::vector<std::string> sub(args.begin() + 2, args.end());
+    return run_doctor(sub);
+  }
   if (command == "agent") {
     std::vector<std::string> sub(args.begin() + 2, args.end());
     return run_agent(sub);
+  }
+  if (command == "send") {
+    std::vector<std::string> sub(args.begin() + 2, args.end());
+    return run_send(sub);
+  }
+  if (command == "transcribe") {
+    std::vector<std::string> sub(args.begin() + 2, args.end());
+    return run_transcribe(sub);
+  }
+  if (command == "metrics") {
+    std::vector<std::string> sub(args.begin() + 2, args.end());
+    return run_metrics(sub);
+  }
+  if (command == "dashboard") {
+    std::vector<std::string> sub(args.begin() + 2, args.end());
+    return run_dashboard(sub, fs::path(args[0]));
   }
   if (command == "gateway") {
     return run_gateway();
@@ -1008,6 +1475,3 @@ int main(int argc, char** argv) {
   print_usage();
   return 1;
 }
-
-
-

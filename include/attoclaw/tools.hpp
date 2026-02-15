@@ -13,6 +13,7 @@
 #include "attoclaw/common.hpp"
 #include "attoclaw/events.hpp"
 #include "attoclaw/http.hpp"
+#include "attoclaw/vision.hpp"
 
 namespace attoclaw {
 
@@ -625,6 +626,9 @@ class ScreenCaptureTool : public Tool {
     if (!enabled_.load()) {
       return "Error: vision tools are disabled for this request. Add --vision in your message.";
     }
+    if (is_headless_server()) {
+      return "Error: vision is unavailable on headless server (DISPLAY/WAYLAND_DISPLAY not set).";
+    }
 
     fs::path out;
     const std::string user_path = trim(params.value("path", ""));
@@ -664,11 +668,21 @@ class ScreenCaptureTool : public Tool {
       return "Error: " + out_err;
     }
 #else
+    std::string dep_note;
+    if (!ensure_vision_capture_dependencies(&dep_note)) {
+      return "Error: " + dep_note;
+    }
+
     const std::string path_abs = fs::absolute(out).string();
-    std::string command = "sh -lc \"";
-    command += "if command -v grim >/dev/null 2>&1; then grim '" + path_abs + "'; ";
-    command += "elif command -v scrot >/dev/null 2>&1; then scrot '" + path_abs + "'; ";
-    command += "else echo 'No screenshot tool (grim/scrot) found' >&2; exit 1; fi\"";
+    const std::string path_q = sh_single_quote(path_abs);
+    std::string command;
+    if (command_exists_in_path("grim")) {
+      command = "sh -lc \"grim " + path_q + "\"";
+    } else if (command_exists_in_path("scrot")) {
+      command = "sh -lc \"scrot " + path_q + "\"";
+    } else {
+      return "Error: no screenshot tool available (grim/scrot).";
+    }
     CommandResult res = run_command_capture(command, 30);
     if (!res.ok) {
       std::string out_err = trim(res.output);
@@ -718,7 +732,7 @@ class WebSearchTool : public Tool {
     const std::string url =
         "https://api.search.brave.com/res/v1/web/search?q=" + encoded + "&count=" + std::to_string(count);
 
-    HttpClient client;
+    thread_local HttpClient client;
     HttpResponse resp = client.get(url,
                                    {
                                        {"Accept", "application/json"},
@@ -782,6 +796,110 @@ class WebSearchTool : public Tool {
   int max_results_;
 };
 
+class TranscribeTool : public Tool {
+ public:
+  TranscribeTool(std::string api_key, std::string api_base, std::string model, int timeout_s)
+      : api_key_(std::move(api_key)),
+        api_base_(std::move(api_base)),
+        model_(trim(model).empty() ? std::string() : std::move(model)),
+        timeout_s_(std::clamp(timeout_s, 10, 900)) {}
+
+  std::string name() const override { return "transcribe"; }
+  std::string description() const override {
+    return "Transcribe an audio file to text via an OpenAI-compatible /audio/transcriptions endpoint";
+  }
+  json parameters() const override {
+    return json{{"type", "object"},
+                {"properties",
+                 {{"path", {{"type", "string"}}},
+                  {"language", {{"type", "string"}}},
+                  {"prompt", {{"type", "string"}}}}},
+                {"required", json::array({"path"})}};
+  }
+
+  std::string execute(const json& params) override {
+    if (trim(api_base_).empty()) {
+      return "Error: transcription apiBase not configured";
+    }
+
+    if (trim(api_key_).empty() && !is_local_nim_endpoint(api_base_)) {
+      return "Error: transcription apiKey not configured";
+    }
+
+    const std::string raw_path = trim(params.value("path", ""));
+    if (raw_path.empty()) {
+      return "Error: path is required";
+    }
+    const fs::path p = fs::weakly_canonical(expand_user_path(raw_path));
+    std::error_code ec;
+    if (!fs::exists(p, ec) || !fs::is_regular_file(p, ec)) {
+      return "Error: file not found: " + p.string();
+    }
+
+    std::string base = trim(api_base_);
+    while (!base.empty() && base.back() == '/') {
+      base.pop_back();
+    }
+    const std::string url = base + "/audio/transcriptions";
+
+    std::vector<MultipartField> fields;
+    const std::string model = trim(model_);
+    if (!model.empty() && model != "auto") {
+      fields.push_back({"model", model});
+    }
+    const std::string language = trim(params.value("language", ""));
+    if (!language.empty()) {
+      fields.push_back({"language", language});
+    }
+    const std::string prompt = trim(params.value("prompt", ""));
+    if (!prompt.empty()) {
+      fields.push_back({"prompt", prompt});
+    }
+
+    thread_local HttpClient client;
+    std::map<std::string, std::string> headers;
+    if (!trim(api_key_).empty()) {
+      headers["Authorization"] = "Bearer " + api_key_;
+    }
+    HttpResponse resp = client.post_multipart_file(
+        url, headers,
+        fields, "file", p, "", timeout_s_, true, 5);
+
+    if (!resp.error.empty()) {
+      return "Error: " + resp.error;
+    }
+    if (resp.status < 200 || resp.status >= 300) {
+      return "Error: HTTP " + std::to_string(resp.status) + " - " + resp.body;
+    }
+
+    try {
+      const json data = json::parse(resp.body);
+      if (data.contains("text") && data["text"].is_string()) {
+        return data["text"].get<std::string>();
+      }
+      if (data.contains("transcript") && data["transcript"].is_string()) {
+        return data["transcript"].get<std::string>();
+      }
+      return resp.body;
+    } catch (...) {
+      return resp.body;
+    }
+  }
+
+ private:
+  std::string api_key_;
+  std::string api_base_;
+  std::string model_;
+  int timeout_s_{180};
+
+  static bool is_local_nim_endpoint(const std::string& base) {
+    const std::string b = trim(base);
+    // Riva ASR NIM default is http://localhost:9000/v1
+    return b.find("://localhost") != std::string::npos || b.find("://127.0.0.1") != std::string::npos ||
+           b.rfind("http://0.0.0.0", 0) == 0 || b.rfind("http://[::1]", 0) == 0;
+  }
+};
+
 class WebFetchTool : public Tool {
  public:
   explicit WebFetchTool(int max_chars = 50000) : max_chars_(max_chars) {}
@@ -806,7 +924,7 @@ class WebFetchTool : public Tool {
       return json({{"error", "Only http/https URLs allowed"}, {"url", url}}).dump();
     }
 
-    HttpClient client;
+    thread_local HttpClient client;
     HttpResponse resp = client.get(url, { {"Accept", "*/*"} }, 30, true, 5);
     if (!resp.error.empty()) {
       return json({{"error", resp.error}, {"url", url}}).dump();
@@ -957,4 +1075,3 @@ class SpawnTool : public Tool {
 };
 
 }  // namespace attoclaw
-

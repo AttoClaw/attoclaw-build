@@ -1,0 +1,12 @@
+services:
+  attoclaw:
+    build: .
+    image: attoclaw:local
+    command: ["gateway"]
+    environment:
+      - HOME=/data
+    volumes:
+      - attoclaw_data:/data
+
+volumes:
+  attoclaw_data:

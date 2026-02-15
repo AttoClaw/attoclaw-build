@@ -14,7 +14,7 @@ struct InboundMessage {
   std::string chat_id;
   std::string content;
   std::string timestamp{now_iso8601()};
-  std::vector<std::string> media;
+  std::vector<std::string> media{};
   json metadata{json::object()};
 
   std::string session_key() const { return channel + ":" + chat_id; }
@@ -24,10 +24,9 @@ struct OutboundMessage {
   std::string channel;
   std::string chat_id;
   std::string content;
-  std::string reply_to;
-  std::vector<std::string> media;
+  std::string reply_to{};
+  std::vector<std::string> media{};
   json metadata{json::object()};
 };
 
 }  // namespace attoclaw
-

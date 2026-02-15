@@ -32,9 +32,17 @@ struct WebSearchConfig {
   int max_results{5};
 };
 
+struct TranscribeConfig {
+  std::string api_key;
+  std::string api_base;
+  std::string model{"whisper-1"};
+  int timeout{180};
+};
+
 struct ToolsConfig {
   ExecConfig exec{};
   WebSearchConfig web_search{};
+  TranscribeConfig transcribe{};
   bool restrict_to_workspace{false};
 };
 
@@ -54,9 +62,37 @@ struct WhatsAppChannelConfig : BasicChannelConfig {
   std::vector<std::string> allow_from;
 };
 
+struct SlackChannelConfig : BasicChannelConfig {
+  std::string token;
+  std::vector<std::string> channels;
+  std::vector<std::string> allow_from;
+  int poll_seconds{3};
+};
+
+struct DiscordChannelConfig : BasicChannelConfig {
+  std::string token;
+  std::string api_base{"https://discord.com/api/v10"};
+  std::vector<std::string> channels;
+  std::vector<std::string> allow_from;
+  int poll_seconds{3};
+};
+
+struct EmailChannelConfig : BasicChannelConfig {
+  std::string smtp_url;
+  bool use_ssl{true};
+  std::string username;
+  std::string password;
+  std::string from;
+  std::vector<std::string> default_to;
+  std::string subject_prefix{"AttoClaw"};
+};
+
 struct ChannelsConfig {
   WhatsAppChannelConfig whatsapp{};
   TelegramChannelConfig telegram{};
+  SlackChannelConfig slack{};
+  DiscordChannelConfig discord{};
+  EmailChannelConfig email{};
 };
 
 struct Config {
@@ -155,6 +191,7 @@ inline json default_config_json() {
        {
            {"exec", {{"timeout", 60}}},
            {"web", {{"search", {{"apiKey", ""}, {"maxResults", 5}}}}},
+           {"transcribe", {{"apiKey", ""}, {"apiBase", ""}, {"model", "whisper-1"}, {"timeout", 180}}},
            {"restrictToWorkspace", false},
        }},
       {"channels",
@@ -162,6 +199,28 @@ inline json default_config_json() {
            {"whatsapp",
             {{"enabled", false}, {"bridgeUrl", "ws://localhost:3001"}, {"bridgeToken", ""}, {"allowFrom", json::array()}}},
            {"telegram", {{"enabled", false}, {"token", ""}, {"allowFrom", json::array()}, {"proxy", ""}}},
+           {"slack",
+            {{"enabled", false},
+             {"token", ""},
+             {"channels", json::array()},
+             {"allowFrom", json::array()},
+             {"pollSeconds", 3}}},
+           {"discord",
+            {{"enabled", false},
+             {"token", ""},
+             {"apiBase", "https://discord.com/api/v10"},
+             {"channels", json::array()},
+             {"allowFrom", json::array()},
+             {"pollSeconds", 3}}},
+           {"email",
+            {{"enabled", false},
+             {"smtpUrl", ""},
+             {"useSsl", true},
+             {"username", ""},
+             {"password", ""},
+             {"from", ""},
+             {"defaultTo", json::array()},
+             {"subjectPrefix", "AttoClaw"}}},
        }}};
 }
 
@@ -287,6 +346,13 @@ inline Config load_config(const fs::path& path = get_config_path()) {
           cfg.tools.web_search.max_results = web["search"].value("maxResults", cfg.tools.web_search.max_results);
         }
       }
+      if (tools.contains("transcribe") && tools["transcribe"].is_object()) {
+        const auto& t = tools["transcribe"];
+        cfg.tools.transcribe.api_key = resolve_env_ref(t.value("apiKey", cfg.tools.transcribe.api_key));
+        cfg.tools.transcribe.api_base = t.value("apiBase", cfg.tools.transcribe.api_base);
+        cfg.tools.transcribe.model = t.value("model", cfg.tools.transcribe.model);
+        cfg.tools.transcribe.timeout = t.value("timeout", cfg.tools.transcribe.timeout);
+      }
     }
 
     if (root.contains("channels") && root["channels"].is_object()) {
@@ -296,7 +362,7 @@ inline Config load_config(const fs::path& path = get_config_path()) {
         const auto& wa = channels["whatsapp"];
         cfg.channels.whatsapp.enabled = wa.value("enabled", cfg.channels.whatsapp.enabled);
         cfg.channels.whatsapp.bridge_url = wa.value("bridgeUrl", cfg.channels.whatsapp.bridge_url);
-        cfg.channels.whatsapp.bridge_token = wa.value("bridgeToken", cfg.channels.whatsapp.bridge_token);
+        cfg.channels.whatsapp.bridge_token = resolve_env_ref(wa.value("bridgeToken", cfg.channels.whatsapp.bridge_token));
         if (wa.contains("allowFrom") && wa["allowFrom"].is_array()) {
           cfg.channels.whatsapp.allow_from.clear();
           for (const auto& item : wa["allowFrom"]) {
@@ -312,7 +378,7 @@ inline Config load_config(const fs::path& path = get_config_path()) {
       if (channels.contains("telegram") && channels["telegram"].is_object()) {
         const auto& tg = channels["telegram"];
         cfg.channels.telegram.enabled = tg.value("enabled", cfg.channels.telegram.enabled);
-        cfg.channels.telegram.token = tg.value("token", cfg.channels.telegram.token);
+        cfg.channels.telegram.token = resolve_env_ref(tg.value("token", cfg.channels.telegram.token));
         cfg.channels.telegram.proxy = tg.value("proxy", cfg.channels.telegram.proxy);
         if (tg.contains("allowFrom") && tg["allowFrom"].is_array()) {
           cfg.channels.telegram.allow_from.clear();
@@ -321,6 +387,76 @@ inline Config load_config(const fs::path& path = get_config_path()) {
               cfg.channels.telegram.allow_from.push_back(item.get<std::string>());
             } else if (item.is_number_integer()) {
               cfg.channels.telegram.allow_from.push_back(std::to_string(item.get<long long>()));
+            }
+          }
+        }
+      }
+
+      if (channels.contains("slack") && channels["slack"].is_object()) {
+        const auto& s = channels["slack"];
+        cfg.channels.slack.enabled = s.value("enabled", cfg.channels.slack.enabled);
+        cfg.channels.slack.token = resolve_env_ref(s.value("token", cfg.channels.slack.token));
+        cfg.channels.slack.poll_seconds = s.value("pollSeconds", cfg.channels.slack.poll_seconds);
+        if (s.contains("channels") && s["channels"].is_array()) {
+          cfg.channels.slack.channels.clear();
+          for (const auto& item : s["channels"]) {
+            if (item.is_string()) {
+              cfg.channels.slack.channels.push_back(item.get<std::string>());
+            }
+          }
+        }
+        if (s.contains("allowFrom") && s["allowFrom"].is_array()) {
+          cfg.channels.slack.allow_from.clear();
+          for (const auto& item : s["allowFrom"]) {
+            if (item.is_string()) {
+              cfg.channels.slack.allow_from.push_back(item.get<std::string>());
+            } else if (item.is_number_integer()) {
+              cfg.channels.slack.allow_from.push_back(std::to_string(item.get<long long>()));
+            }
+          }
+        }
+      }
+
+      if (channels.contains("discord") && channels["discord"].is_object()) {
+        const auto& d = channels["discord"];
+        cfg.channels.discord.enabled = d.value("enabled", cfg.channels.discord.enabled);
+        cfg.channels.discord.token = resolve_env_ref(d.value("token", cfg.channels.discord.token));
+        cfg.channels.discord.api_base = d.value("apiBase", cfg.channels.discord.api_base);
+        cfg.channels.discord.poll_seconds = d.value("pollSeconds", cfg.channels.discord.poll_seconds);
+        if (d.contains("channels") && d["channels"].is_array()) {
+          cfg.channels.discord.channels.clear();
+          for (const auto& item : d["channels"]) {
+            if (item.is_string()) {
+              cfg.channels.discord.channels.push_back(item.get<std::string>());
+            }
+          }
+        }
+        if (d.contains("allowFrom") && d["allowFrom"].is_array()) {
+          cfg.channels.discord.allow_from.clear();
+          for (const auto& item : d["allowFrom"]) {
+            if (item.is_string()) {
+              cfg.channels.discord.allow_from.push_back(item.get<std::string>());
+            } else if (item.is_number_integer()) {
+              cfg.channels.discord.allow_from.push_back(std::to_string(item.get<long long>()));
+            }
+          }
+        }
+      }
+
+      if (channels.contains("email") && channels["email"].is_object()) {
+        const auto& e = channels["email"];
+        cfg.channels.email.enabled = e.value("enabled", cfg.channels.email.enabled);
+        cfg.channels.email.smtp_url = e.value("smtpUrl", cfg.channels.email.smtp_url);
+        cfg.channels.email.use_ssl = e.value("useSsl", cfg.channels.email.use_ssl);
+        cfg.channels.email.username = resolve_env_ref(e.value("username", cfg.channels.email.username));
+        cfg.channels.email.password = resolve_env_ref(e.value("password", cfg.channels.email.password));
+        cfg.channels.email.from = resolve_env_ref(e.value("from", cfg.channels.email.from));
+        cfg.channels.email.subject_prefix = e.value("subjectPrefix", cfg.channels.email.subject_prefix);
+        if (e.contains("defaultTo") && e["defaultTo"].is_array()) {
+          cfg.channels.email.default_to.clear();
+          for (const auto& item : e["defaultTo"]) {
+            if (item.is_string()) {
+              cfg.channels.email.default_to.push_back(item.get<std::string>());
             }
           }
         }
@@ -346,4 +482,3 @@ inline bool save_default_config(const fs::path& path = get_config_path()) {
 }
 
 }  // namespace attoclaw
-

@@ -66,14 +66,14 @@ class WhatsAppChannel : public BaseChannel {
       return;
     }
 
-    {
-      std::lock_guard<std::mutex> lock(out_mu_);
-      outbox_.push_back(PendingSend{to, text});
+    constexpr std::size_t kLimit = 1500;
+    for (const auto& part : chunk_text(text, kLimit)) {
+      {
+        std::lock_guard<std::mutex> lock(out_mu_);
+        outbox_.push_back(PendingSend{to, part});
+      }
+      out_cv_.notify_one();
     }
-    Logger::log(Logger::Level::kInfo,
-                "WhatsApp outbound queued to " + to + ": " +
-                    text.substr(0, (std::min<std::size_t>)(text.size(), 120)));
-    out_cv_.notify_one();
   }
 
  private:
@@ -207,20 +207,41 @@ class WhatsAppChannel : public BaseChannel {
       if (type == "message") {
         const std::string sender = data.value("sender", "");
         const std::string pn = data.value("pn", "");
-        const std::string content = data.value("content", "");
-        if (sender.empty() || trim(content).empty()) {
+        std::string content = data.value("content", "");
+        if (sender.empty()) {
           return;
         }
         if (!is_allowed_sender(sender, pn)) {
           return;
         }
 
+        std::vector<std::string> media_paths;
+        if (data.contains("media") && data["media"].is_array()) {
+          for (const auto& m : data["media"]) {
+            if (m.is_object()) {
+              const std::string path = m.value("path", "");
+              if (!trim(path).empty()) {
+                media_paths.push_back(path);
+              }
+            } else if (m.is_string()) {
+              const std::string path = m.get<std::string>();
+              if (!trim(path).empty()) {
+                media_paths.push_back(path);
+              }
+            }
+          }
+        }
+
+        if (trim(content).empty() && !media_paths.empty()) {
+          content = "Voice/audio received. Please transcribe and respond.";
+        }
+        if (trim(content).empty() && media_paths.empty()) {
+          return;
+        }
+
         const std::string user = !trim(pn).empty() ? pn : sender;
         const std::string sender_id = strip_jid_domain(user);
-        Logger::log(Logger::Level::kInfo,
-                    "WhatsApp inbound from " + sender_id + " (" + sender + "): " +
-                        content.substr(0, (std::min<std::size_t>)(content.size(), 120)));
-        handle_message(sender_id, sender, content);
+        handle_message(sender_id, sender, content, media_paths, data);
         return;
       }
 
@@ -352,5 +373,3 @@ class WhatsAppChannel : public BaseChannel {
 };
 
 }  // namespace attoclaw
-
-

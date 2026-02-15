@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -32,6 +33,24 @@ inline std::string trim(const std::string& s) {
   }
   const auto end = s.find_last_not_of(" \t\r\n");
   return s.substr(start, end - start + 1);
+}
+
+inline std::vector<std::string> chunk_text(const std::string& s, std::size_t max_chars) {
+  std::vector<std::string> out;
+  if (max_chars == 0) {
+    return out;
+  }
+  if (s.size() <= max_chars) {
+    out.push_back(s);
+    return out;
+  }
+  std::size_t i = 0;
+  while (i < s.size()) {
+    const std::size_t n = (std::min)(max_chars, s.size() - i);
+    out.push_back(s.substr(i, n));
+    i += n;
+  }
+  return out;
 }
 
 inline std::string home_dir() {
@@ -142,13 +161,51 @@ class Logger {
  public:
   enum class Level { kInfo, kWarn, kError, kDebug };
 
+  static void set_json(bool enabled) { json_mode().store(enabled); }
+  static void set_min_level(Level level) { min_level() = level; }
+
   static void log(Level level, const std::string& msg) {
+    if (level_rank(level) < level_rank(min_level())) {
+      return;
+    }
     static std::mutex mu;
     std::lock_guard<std::mutex> lock(mu);
-    std::cerr << "[" << level_name(level) << "] " << msg << "\n";
+    if (json_mode().load()) {
+      json j;
+      j["time"] = now_iso8601();
+      j["level"] = level_name(level);
+      j["msg"] = msg;
+      std::cerr << j.dump() << "\n";
+    } else {
+      std::cerr << "[" << level_name(level) << "] " << msg << "\n";
+    }
   }
 
  private:
+  static int level_rank(Level level) {
+    switch (level) {
+      case Level::kDebug:
+        return 0;
+      case Level::kInfo:
+        return 1;
+      case Level::kWarn:
+        return 2;
+      case Level::kError:
+      default:
+        return 3;
+    }
+  }
+
+  static std::atomic<bool>& json_mode() {
+    static std::atomic<bool> v{false};
+    return v;
+  }
+
+  static Level& min_level() {
+    static Level v = Level::kInfo;
+    return v;
+  }
+
   static const char* level_name(Level level) {
     switch (level) {
       case Level::kInfo:
@@ -165,4 +222,3 @@ class Logger {
 };
 
 }  // namespace attoclaw
-
