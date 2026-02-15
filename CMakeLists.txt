@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.20)
 project(AttoClaw VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -30,10 +30,20 @@ if(MSVC)
   target_link_options(attoclaw PRIVATE $<$<CONFIG:Release>:/LTCG> $<$<CONFIG:Release>:/OPT:REF> $<$<CONFIG:Release>:/OPT:ICF>)
 else()
   target_compile_options(attoclaw PRIVATE -Wall -Wextra -Wpedantic -O3)
+  
+  # Optimization flags for GCC/Clang
   target_compile_options(attoclaw PRIVATE $<$<CONFIG:Release>:-ffunction-sections> $<$<CONFIG:Release>:-fdata-sections>)
-  target_link_options(attoclaw PRIVATE $<$<CONFIG:Release>:-Wl,--gc-sections>)
+
+  if(APPLE)
+    # macOS specific linker flag for dead code stripping
+    target_link_options(attoclaw PRIVATE $<$<CONFIG:Release>:-Wl,-dead_strip>)
+  else()
+    # Linux/GNU linker flag
+    target_link_options(attoclaw PRIVATE $<$<CONFIG:Release>:-Wl,--gc-sections>)
+  endif()
 endif()
 
+# Enable Link Time Optimization (LTO) if supported
 check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
 if(IPO_SUPPORTED)
   set_property(TARGET attoclaw PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
