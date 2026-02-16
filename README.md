@@ -4,8 +4,6 @@
 <img src="./attoclaw.png" alt="AttoClaw Logo" width="728" height="256"/>
 </p>
 
-[![Build](https://github.com/AttoClaw/attoclaw-build/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/AttoClaw/attoclaw-build/actions/workflows/ci.yml)
-
 AttoClaw is a high-performance C++ port of openclaw focused on low overhead, deterministic runtime behavior, and practical local automation.
 
 This repo currently builds a single binary:
